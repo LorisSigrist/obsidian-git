@@ -1483,6 +1483,8 @@ export class WasmGit extends GitManager {
         config.set("core.bare", "false");
         config.set("core.logallrefupdates", "true");
         config.set("core.symlinks", "false");
+        // Phone and macOS storage is case-insensitive.
+        config.set("core.ignorecase", "true");
         await repo.writeConfig(config);
     }
 
@@ -1509,65 +1511,96 @@ export class WasmGit extends GitManager {
             if (await repo.exists()) {
                 throw new Error(`A repository already exists in ${dir}.`);
             }
-            await this.initAt(repo);
-            const config = await repo.readConfig();
-            config.set("remote.origin.url", url);
-            config.set(
-                "remote.origin.fetch",
-                "+refs/heads/*:refs/remotes/origin/*"
-            );
-            await repo.writeConfig(config);
-
-            const { remoteRefs } = await fetchRemote(repo, {
-                url,
-                http: this.http,
-                auth: this.authCallbacks(),
-                remote: "origin",
-                refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
-                depth,
-                onProgress: progressNotice
-                    ? (m) => {
-                          const last = m
-                              .split(/[\r\n]/)
-                              .filter(Boolean)
-                              .last();
-                          if (last)
-                              progressNotice.setMessage(`Cloning: ${last}`);
-                      }
-                    : undefined,
-            });
-            const branchRef =
-                remoteRefs.headTarget ??
-                ["refs/heads/main", "refs/heads/master"].find((r) =>
-                    remoteRefs.refs.has(r)
-                ) ??
-                [...remoteRefs.refs.keys()].find((r) =>
-                    r.startsWith("refs/heads/")
-                );
-            if (!branchRef) return; // empty remote: an empty repository
-            const branch = branchRef.slice("refs/heads/".length);
-            const tip = await repo.resolveCommit(
-                `refs/remotes/origin/${branch}`
-            );
-            await repo.refs.writeSymbolic("HEAD", branchRef);
-            const index = new GitIndex();
-            await checkoutTree(
-                repo,
-                index,
-                0,
-                await repo.ignoreRules(),
-                undefined,
-                (await repo.objects.readCommit(tip)).tree
-            );
-            await repo.writeIndex(index);
-            await repo.refs.write(branchRef, tip);
-            const cfg = await repo.readConfig();
-            cfg.set(`branch.${branch}.remote`, "origin");
-            cfg.set(`branch.${branch}.merge`, branchRef);
-            await repo.writeConfig(cfg);
-            this.cachedRepo = undefined;
+            try {
+                await this.cloneInto(repo, url, depth, progressNotice);
+            } catch (e) {
+                // Leave nothing behind, so the clone can simply be retried
+                // and a half-made repository is never mistaken for a real one.
+                await repo.fs.rmdir(gitdir, true).catch(() => undefined);
+                throw e;
+            } finally {
+                this.cachedRepo = undefined;
+            }
         } finally {
             progressNotice?.hide();
         }
+    }
+
+    private async cloneInto(
+        repo: Repository,
+        url: string,
+        depth: number | undefined,
+        progressNotice: Notice | undefined
+    ): Promise<void> {
+        await this.initAt(repo);
+        const config = await repo.readConfig();
+        config.set("remote.origin.url", url);
+        config.set(
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*"
+        );
+        await repo.writeConfig(config);
+
+        const { remoteRefs } = await fetchRemote(repo, {
+            url,
+            http: this.http,
+            auth: this.authCallbacks(),
+            remote: "origin",
+            // Tags come along, as with `git clone`.
+            refspecs: [
+                "+refs/heads/*:refs/remotes/origin/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+            depth,
+            onProgress: progressNotice
+                ? (m) => {
+                      const last = m
+                          .split(/[\r\n]/)
+                          .filter(Boolean)
+                          .last();
+                      if (last) progressNotice.setMessage(`Cloning: ${last}`);
+                  }
+                : undefined,
+        });
+        // The remote's default branch: from the symref capability, else
+        // the branch whose tip matches the remote's HEAD.
+        const headOid = remoteRefs.refs.get("HEAD");
+        const branches = [...remoteRefs.refs.keys()].filter((r) =>
+            r.startsWith("refs/heads/")
+        );
+        const byHead = branches.filter(
+            (r) => remoteRefs.refs.get(r) === headOid
+        );
+        const branchRef =
+            remoteRefs.headTarget ??
+            ["refs/heads/main", "refs/heads/master"].find((r) =>
+                byHead.includes(r)
+            ) ??
+            byHead[0] ??
+            ["refs/heads/main", "refs/heads/master"].find((r) =>
+                remoteRefs.refs.has(r)
+            ) ??
+            [...remoteRefs.refs.keys()].find((r) =>
+                r.startsWith("refs/heads/")
+            );
+        if (!branchRef) return; // empty remote: an empty repository
+        const branch = branchRef.slice("refs/heads/".length);
+        const tip = await repo.resolveCommit(`refs/remotes/origin/${branch}`);
+        await repo.refs.writeSymbolic("HEAD", branchRef);
+        const index = new GitIndex();
+        await checkoutTree(
+            repo,
+            index,
+            0,
+            await repo.ignoreRules(),
+            undefined,
+            (await repo.objects.readCommit(tip)).tree
+        );
+        await repo.writeIndex(index);
+        await repo.refs.write(branchRef, tip);
+        const cfg = await repo.readConfig();
+        cfg.set(`branch.${branch}.remote`, "origin");
+        cfg.set(`branch.${branch}.merge`, branchRef);
+        await repo.writeConfig(cfg);
     }
 }

@@ -473,3 +473,45 @@ describe("WasmGit init and clone", { timeout: 300_000 }, () => {
         execFileSync("git", ["fsck", "--strict"], { cwd: vault });
     });
 });
+
+describe("WasmGit phase 6 review regressions", { timeout: 300_000 }, () => {
+    it("leaves nothing behind when a clone fails, so it can be retried", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.raw(["tag", "v1"]);
+        await repo.raw(["push", "-q", "origin", "v1"]);
+        const server = await startGitHttpServer(repo.dir);
+        try {
+            const vault = path.join(repo.dir, "vault");
+            execFileSync("mkdir", ["-p", vault]);
+            writeFileSync(path.join(vault, "note.md"), "in the way\n");
+            const { manager, plugin } = createWasmGitManager(vault, {
+                vaultPath: vault,
+            });
+            manager.http = nodeHttp;
+            plugin.settings.disablePopups = true;
+
+            await expect(
+                manager.clone(server.url("missing.git"), ".")
+            ).rejects.toThrow();
+            expect(await manager.checkRequirements()).toBe("missing-repo");
+            await expect(
+                manager.clone(server.url("remote.git"), ".")
+            ).rejects.toThrow(/note\.md/);
+            expect(await manager.checkRequirements()).toBe("missing-repo");
+
+            execFileSync("rm", [path.join(vault, "note.md")]);
+            await manager.clone(server.url("remote.git"), ".");
+            expect(await manager.checkRequirements()).toBe("valid");
+            const g = (...args: string[]) =>
+                execFileSync("git", args, {
+                    cwd: vault,
+                    encoding: "utf8",
+                }).trim();
+            expect(g("status", "--porcelain")).toBe("");
+            expect(g("tag")).toBe("v1");
+            expect(g("config", "core.ignorecase")).toBe("true");
+        } finally {
+            await server.close();
+        }
+    });
+});
