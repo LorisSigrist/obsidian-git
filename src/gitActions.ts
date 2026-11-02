@@ -1,8 +1,8 @@
-import { Errors } from "isomorphic-git";
 import { normalizePath, Notice, Platform, TFile, moment } from "obsidian";
 import * as fsPromises from "fs/promises";
 import { CustomMessageModal } from "src/ui/modals/customMessageModal";
-import { IsomorphicGit } from "./gitManager/isomorphicGit";
+import { UserCanceledError } from "./gitManager/gitcore/errors";
+import { WasmGit } from "./gitManager/wasmGit";
 import { SimpleGit } from "./gitManager/simpleGit";
 import type {
     CommitAndSyncResult,
@@ -185,12 +185,12 @@ export class GitActions {
         const confirmOption = "Vault Root";
         let dir = await new GeneralModal(this.plugin, {
             options:
-                this.plugin.gitManager instanceof IsomorphicGit
+                this.plugin.gitManager instanceof WasmGit
                     ? [confirmOption]
                     : [],
             placeholder:
                 "Enter directory for clone. It needs to be empty or not existent.",
-            allowEmpty: this.plugin.gitManager instanceof IsomorphicGit,
+            allowEmpty: this.plugin.gitManager instanceof WasmGit,
         }).openAndGetResult();
         if (dir === undefined) {
             return { status: "cancelled", reason: "no-directory" };
@@ -630,13 +630,13 @@ export class GitActions {
                 ) {
                     cmtMessage = modalMessage;
                 } else {
-                    throw new Errors.UserCanceledError();
+                    throw new UserCanceledError();
                 }
             }
 
             // Check if commit message is empty after all processing
             if (!cmtMessage || cmtMessage.trim() === "") {
-                throw new Errors.UserCanceledError();
+                throw new UserCanceledError();
             }
 
             let committedFiles: number;

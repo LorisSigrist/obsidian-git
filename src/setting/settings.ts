@@ -19,7 +19,7 @@ import {
     GIT_LINE_AUTHORING_MOVEMENT_DETECTION_MINIMAL_LENGTH,
     HISTORY_VIEW_CONFIG,
 } from "src/constants";
-import { IsomorphicGit } from "src/gitManager/isomorphicGit";
+import { WasmGit } from "src/gitManager/wasmGit";
 import { SimpleGit } from "src/gitManager/simpleGit";
 import { previewColor } from "src/editor/lineAuthor/lineAuthorProvider";
 import type {
@@ -182,7 +182,7 @@ export class ObsidianGitSettingsTab extends PluginSettingTab {
     getSettingDefinitions(): SettingDefinitionItem[] {
         const ready = () => this.plugin.gitReady;
         const desktop = () => this.plugin.gitManager instanceof SimpleGit;
-        const mobile = () => this.plugin.gitManager instanceof IsomorphicGit;
+        const mobile = () => this.plugin.gitManager instanceof WasmGit;
         const automatic = this.commitOrSync;
         return [
             {

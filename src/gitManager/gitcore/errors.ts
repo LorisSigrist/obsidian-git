@@ -21,6 +21,9 @@ export class UserCanceledError extends GitError {
 
 /** The remote refused a ref update, usually because it is not a fast-forward. */
 export class PushRejectedError extends GitError {
+    /** Same shape as isomorphic-git's error, which the plugin reads. */
+    readonly data: { reason: string };
+
     /** "not-fast-forward", or the reason the remote gave. */
     constructor(readonly reason: string) {
         super(
@@ -28,6 +31,7 @@ export class PushRejectedError extends GitError {
                 ? "Push rejected because it was not a simple fast-forward. Use 'force: true' to override."
                 : `Push rejected: ${reason}`
         );
+        this.data = { reason };
     }
 }
 

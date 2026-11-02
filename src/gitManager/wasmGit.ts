@@ -24,7 +24,7 @@ import {
     NotFoundError,
     UnmergedPathsError,
 } from "./gitcore/errors";
-import type { GitIndex, IndexEntry } from "./gitcore/gitIndex";
+import { GitIndex, type IndexEntry } from "./gitcore/gitIndex";
 import type { Person } from "./gitcore/model";
 import type { RangeReader } from "./gitcore/repoFs";
 import {
@@ -1458,16 +1458,116 @@ export class WasmGit extends GitManager {
         );
     }
 
-    // ---- Not yet implemented (later phases) ----
+    // ---- Creating repositories ----
 
-    private notYet(name: string): never {
-        throw new Error(`${name} is not implemented in the WASM backend yet`);
+    /** Create an empty repository at the configured location (`git init`). */
+    async init(): Promise<void> {
+        await this.initAt(await this.repo());
     }
 
-    init(): Promise<void> {
-        this.notYet("init");
+    private async initAt(repo: Repository): Promise<void> {
+        if (await repo.exists()) return;
+        const fs = repo.fs;
+        for (const dir of [
+            "objects/info",
+            "objects/pack",
+            "refs/heads",
+            "refs/tags",
+        ]) {
+            await fs.mkdirp(`${repo.gitdir}/${dir}`);
+        }
+        await repo.refs.writeSymbolic("HEAD", "refs/heads/main");
+        const config = await repo.readConfig();
+        config.set("core.repositoryformatversion", "0");
+        config.set("core.filemode", "false");
+        config.set("core.bare", "false");
+        config.set("core.logallrefupdates", "true");
+        config.set("core.symlinks", "false");
+        await repo.writeConfig(config);
     }
-    clone(_: string, __: string, ___?: number): Promise<void> {
-        this.notYet("clone");
+
+    /**
+     * Clone `url` into vault folder `dir` ("." for the vault root): init,
+     * fetch (shallow with `depth`), create the remote's default branch with
+     * its upstream, and check it out. Untracked files in the way are not
+     * overwritten; the clone stops before writing any file instead.
+     */
+    async clone(url: string, dir: string, depth?: number): Promise<void> {
+        const progressNotice = this.showNotice("Initializing clone");
+        try {
+            const root = dir === "." || dir === "" ? "" : normalizePath(dir);
+            const gitdir = normalizePath(
+                root
+                    ? `${root}/${this.plugin.settings.gitDir || ".git"}`
+                    : this.plugin.settings.gitDir || ".git"
+            );
+            const repo = await new Repository(this.app.vault, {
+                root,
+                gitdir,
+                rangeReader: this.rangeReader,
+            }).ready();
+            if (await repo.exists()) {
+                throw new Error(`A repository already exists in ${dir}.`);
+            }
+            await this.initAt(repo);
+            const config = await repo.readConfig();
+            config.set("remote.origin.url", url);
+            config.set(
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*"
+            );
+            await repo.writeConfig(config);
+
+            const { remoteRefs } = await fetchRemote(repo, {
+                url,
+                http: this.http,
+                auth: this.authCallbacks(),
+                remote: "origin",
+                refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+                depth,
+                onProgress: progressNotice
+                    ? (m) => {
+                          const last = m
+                              .split(/[\r\n]/)
+                              .filter(Boolean)
+                              .last();
+                          if (last)
+                              progressNotice.setMessage(`Cloning: ${last}`);
+                      }
+                    : undefined,
+            });
+            const branchRef =
+                remoteRefs.headTarget ??
+                ["refs/heads/main", "refs/heads/master"].find((r) =>
+                    remoteRefs.refs.has(r)
+                ) ??
+                [...remoteRefs.refs.keys()].find((r) =>
+                    r.startsWith("refs/heads/")
+                );
+            if (!branchRef) return; // empty remote: an empty repository
+            const branch = branchRef.slice("refs/heads/".length);
+            const tip = await repo.resolveCommit(
+                `refs/remotes/origin/${branch}`
+            );
+            await repo.refs.writeSymbolic("HEAD", branchRef);
+            const index = new GitIndex();
+            await checkoutTree(
+                repo,
+                index,
+                0,
+                await repo.ignoreRules(),
+                undefined,
+                (await repo.objects.readCommit(tip)).tree
+            );
+            await repo.writeIndex(index);
+            await repo.refs.write(branchRef, tip);
+            const cfg = await repo.readConfig();
+            cfg.set(`branch.${branch}.remote`, "origin");
+            cfg.set(`branch.${branch}.merge`, branchRef);
+            await repo.writeConfig(cfg);
+            this.cachedRepo = undefined;
+        } finally {
+            progressNotice?.hide();
+        }
     }
 }

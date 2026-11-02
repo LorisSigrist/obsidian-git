@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GitActions } from "../../src/gitActions";
-import { IsomorphicGit } from "../../src/gitManager/isomorphicGit";
+import { WasmGit } from "../../src/gitManager/wasmGit";
 import { GitConflictError, type FileStatusResult } from "../../src/types";
 import { CustomMessageModal } from "../../src/ui/modals/customMessageModal";
 import {
@@ -642,7 +642,7 @@ describe.each(gitManagerBackends)("$name GitManager contract", (backend) => {
         repo.write("untracked.md", "untracked\n");
         repo.remove("deleted.md");
         const extraWalks =
-            manager instanceof IsomorphicGit
+            manager instanceof WasmGit
                 ? [
                       vi.spyOn(manager, "getUnstagedFiles"),
                       vi.spyOn(manager, "getStagedFiles"),
@@ -699,7 +699,7 @@ describe.each(gitManagerBackends)("$name GitManager contract", (backend) => {
             "deleted.md",
             "note.md",
         ]);
-        if (manager instanceof IsomorphicGit) {
+        if (manager instanceof WasmGit) {
             expect(status).not.toHaveBeenCalled();
         }
     });

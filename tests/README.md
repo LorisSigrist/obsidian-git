@@ -105,7 +105,7 @@ before the test finishes.
 ### GitManager Contract Harness
 
 `tests/helpers/gitManagerHarness.ts` exposes the real `SimpleGit` and
-`IsomorphicGit` implementations through the same test context. Shared behavior
+`WasmGit` implementations through the same test context. Shared behavior
 belongs in `tests/gitManager/gitManager.test.ts`, which runs every assertion
 against both backends and gives each test a fresh temporary repository.
 The SimpleGit harness calls `setGitInstance()`; the fixture's separate Git
@@ -124,9 +124,10 @@ The factory also accepts `configurePlugin`, `plugin`, `fixture`, and
 needs a mocked SimpleGit client; otherwise the production `setGitInstance()`
 path is used.
 
-Keep native Git integration details in `simpleGit.test.ts` and
-isomorphic-git filesystem, transport, and merge-metadata details in
-`isomorphicGit.test.ts`.
+Keep native Git integration details in `simpleGit.test.ts` and the mobile
+backend's details in `wasmGit.*.test.ts`, which use native Git as the oracle.
+`tests/helpers/gitHttpServer.ts` serves fixture repositories through
+`git http-backend` for fetch, push and clone tests.
 
 ## Design Principles
 

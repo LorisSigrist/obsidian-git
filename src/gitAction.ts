@@ -1,4 +1,7 @@
-import { Errors } from "isomorphic-git";
+import {
+    PushRejectedError,
+    UserCanceledError,
+} from "./gitManager/gitcore/errors";
 import { GitConflictError, NoNetworkError, type Status } from "./types";
 
 export type GitActionResult<T> =
@@ -23,10 +26,7 @@ export async function runGitAction<T>(
     } catch (error) {
         await reportGitError(host, error);
         return {
-            status:
-                error instanceof Errors.UserCanceledError
-                    ? "cancelled"
-                    : "failed",
+            status: error instanceof UserCanceledError ? "cancelled" : "failed",
         };
     }
 }
@@ -35,7 +35,7 @@ async function reportGitError(
     host: GitActionHost,
     error: unknown
 ): Promise<void> {
-    if (error instanceof Errors.UserCanceledError) {
+    if (error instanceof UserCanceledError) {
         return;
     }
     if (error instanceof GitConflictError) {
@@ -53,7 +53,7 @@ async function reportGitError(
         host.handleNoNetworkError(error);
         return;
     }
-    if (error instanceof Errors.PushRejectedError) {
+    if (error instanceof PushRejectedError) {
         host.log("Push rejected:", error);
         host.displayError(
             error.data.reason === "tag-exists"

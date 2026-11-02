@@ -13,8 +13,11 @@ The main runtime boundary is:
     refresh/reload orchestration, user-facing notices, and cleanup.
 -   `src/gitManager/gitManager.ts` defines the Git capability interface.
 -   `src/gitManager/simpleGit.ts` is the desktop/native Git implementation.
--   `src/gitManager/isomorphicGit.ts` is the mobile/browser-compatible
-    implementation.
+-   `src/gitManager/wasmGit.ts` is the mobile implementation. Its git library
+    lives in `src/gitManager/gitcore/` (TypeScript on Obsidian's file API) and
+    `wasm/gitcore/` (Rust compiled to WebAssembly for packs, zlib and SHA-1;
+    rebuild `wasm/gitcore/pkg` with `pnpm run build:wasm`, which needs
+    `wasm-pack`).
 -   `src/commands.ts` registers stable user-facing command IDs.
 -   `src/ui/` contains source-control, history, diff, modal, and status-bar UI.
 -   `src/editor/` contains CodeMirror integrations for diff signs, hunk actions,
@@ -90,8 +93,8 @@ to bundling, dependencies, manifest/release behavior, or runtime imports.
     repository for any reason.
 -   Preserve the desktop/mobile split. Desktop uses Node/Electron, whereas
     mobile uses Capcitor. Therefore on desktop a native Git installation is used
-    via `simple-git` and on mobile a javascript implementation of git:
-    `isomorphic-git` that uses the Obsidian adapter and `requestUrl`. Note that
+    via `simple-git` and on mobile the plugin's own git implementation
+    (`WasmGit`) that uses the Obsidian adapter and `requestUrl`. Note that
     some features are desktop only. Test or reason about both implementations
     when changing shared Git semantics.
 -   Svelte components are compiled by `esbuild-svelte` with injected CSS. Keep

@@ -75,7 +75,6 @@
         "diff2html": "^3.4.56",
         "diff3": "^0.0.4",
         "ignore": "^7.0.14",
-        "isomorphic-git": "^1.44.3",
         "js-sha256": "^1.0.0",
         "picomatch": "^4.0.7",
         "simple-git": "^4.0.2",

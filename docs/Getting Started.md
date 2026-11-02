@@ -50,10 +50,11 @@ Another alternative for iOS is [Working Copy](https://workingcopy.app/).
 
 ## Restrictions
 
-I am using [isomorphic-git](https://isomorphic-git.org/), which is a re-implementation of Git in JavaScript, because you cannot use native Git on Android or iOS.
+On mobile the plugin uses its own Git implementation on top of Obsidian's file API (with pack handling, compression and hashing in WebAssembly), because you cannot use native Git on Android or iOS.
 
--   SSH authentication is not supported ([isomorphic-git issue](https://github.com/isomorphic-git/isomorphic-git/issues/231))
--   Repo size is limited, because of memory restrictions
+-   Only HTTP(S) remotes are supported; SSH authentication is not
+-   The first clone of a large repository is limited by memory, because Obsidian delivers each HTTP response in one piece
+-   Pulls that need a file/folder rename, criss-cross merges or unrelated histories are refused; merge those on a device with Git
 -   Rebase merge strategy is not supported
 -   Submodules are not supported
 -   Symlinks are not supported because Obsidian's mobile file API does not provide operations to create or read them.

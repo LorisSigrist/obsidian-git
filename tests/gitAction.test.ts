@@ -1,4 +1,7 @@
-import { Errors } from "isomorphic-git";
+import {
+    PushRejectedError,
+    UserCanceledError,
+} from "../src/gitManager/gitcore/errors";
 import { describe, expect, it, vi } from "vitest";
 import { runGitAction, type GitActionHost } from "../src/gitAction";
 import { GitConflictError, type Status } from "../src/types";
@@ -64,7 +67,7 @@ describe("runGitAction", () => {
         const { displayError, handleConflict, host } = createHost();
 
         const result = await runGitAction(host, () =>
-            Promise.reject(new Errors.UserCanceledError())
+            Promise.reject(new UserCanceledError())
         );
 
         expect(result).toEqual({ status: "cancelled" });
@@ -74,7 +77,7 @@ describe("runGitAction", () => {
 
     it("explains a rejected push without suggesting a force push", async () => {
         const { displayError, host } = createHost();
-        const error = new Errors.PushRejectedError("not-fast-forward");
+        const error = new PushRejectedError("not-fast-forward");
 
         const result = await runGitAction(host, () => Promise.reject(error));
 
@@ -88,7 +91,7 @@ describe("runGitAction", () => {
 
     it("explains when a pushed tag already exists", async () => {
         const { displayError, host } = createHost();
-        const error = new Errors.PushRejectedError("tag-exists");
+        const error = new PushRejectedError("tag-exists");
 
         const result = await runGitAction(host, () => Promise.reject(error));
 

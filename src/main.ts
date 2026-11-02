@@ -1,4 +1,3 @@
-import { Errors } from "isomorphic-git";
 import type { Debouncer, Menu, TAbstractFile, WorkspaceLeaf } from "obsidian";
 import {
     debounce,
@@ -25,7 +24,8 @@ import {
     SPLIT_DIFF_VIEW_CONFIG,
 } from "./constants";
 import type { GitManager } from "./gitManager/gitManager";
-import { IsomorphicGit } from "./gitManager/isomorphicGit";
+import { UserCanceledError } from "./gitManager/gitcore/errors";
+import { WasmGit } from "./gitManager/wasmGit";
 import { SimpleGit } from "./gitManager/simpleGit";
 import { LocalStorageSettings } from "./setting/localStorageSettings";
 import { GitServerPassword } from "./setting/gitServerPassword";
@@ -563,7 +563,7 @@ export default class ObsidianGit extends Plugin {
                 this.gitManager = new SimpleGit(this);
                 await (this.gitManager as SimpleGit).setGitInstance();
             } else {
-                this.gitManager = new IsomorphicGit(this);
+                this.gitManager = new WasmGit(this);
             }
 
             const result = await this.gitManager.checkRequirements();
@@ -777,7 +777,7 @@ export default class ObsidianGit extends Plugin {
     }
 
     displayError(data: unknown, timeout: number = 10 * 1000): void {
-        if (data instanceof Errors.UserCanceledError) {
+        if (data instanceof UserCanceledError) {
             new Notice("Aborted");
             return;
         }

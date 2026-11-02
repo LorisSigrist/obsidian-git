@@ -120,12 +120,12 @@ The Git implementation on mobile is **very unstable**! I would not recommend usi
 
 One such alternative is [GitSync](https://github.com/ViscousPot/GitSync), which is available on both Android and iOS. It is not associated with this plugin, but it may be a better option for mobile users. A tutorial for setting it up can be found [here](https://viscouspotenti.al/posts/gitsync-all-devices-tutorial).
 
-> The Git plugin works on mobile thanks to [isomorphic-git](https://isomorphic-git.org/), a JavaScript-based re-implementation of Git - but it comes with serious limitations and issues. It is not possible for an Obsidian plugin to use a native Git installation on Android or iOS.
+> On mobile, the Git plugin uses its own Git implementation built on Obsidian's file API, with pack handling, compression and hashing compiled to WebAssembly, because an Obsidian plugin cannot use a native Git installation on Android or iOS. It comes with limitations.
 
 ### Mobile Feature Limitations
 
-- No **SSH authentication** ([isomorphic-git issue](https://github.com/isomorphic-git/isomorphic-git/issues/231))
-- Limited repo size, because of memory restrictions
+- Only **HTTP(S) remotes**; no SSH authentication
+- The first clone of a large repository is limited by memory, because Obsidian delivers each HTTP response in one piece. Afterwards, packs are read in small ranges and never loaded whole.
 - No rebase merge strategy
 - No submodules support
 

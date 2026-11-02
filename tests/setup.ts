@@ -66,8 +66,9 @@ Object.defineProperty(globalThis, "activeDocument", {
 
 export {};
 
-// Keep tests independent of the developer's git setup: a global
-// `commit.gpgsign=true` (or hooks, templates) makes every fixture commit slow
-// or interactive. Fixtures configure the identity they need per repository.
+// Keep git spawned directly by tests (execFileSync) independent of the
+// developer's global config: a global `commit.gpgsign=true` makes every
+// fixture commit slow. simple-git does not pass these variables on, so its
+// commands still read the global config.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
 process.env.GIT_CONFIG_NOSYSTEM = "1";
