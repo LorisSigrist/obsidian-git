@@ -1239,10 +1239,22 @@ export class WasmGit extends GitManager {
             if (await isAncestor(repo, localCommit, theirs)) {
                 result = theirs;
             } else {
-                const base = (await mergeBases(repo, localCommit, theirs))[0];
+                const bases = await mergeBases(repo, localCommit, theirs);
+                if (bases.length === 0) {
+                    throw new Error(
+                        `Cannot pull: refusing to merge unrelated histories (${branchInfo.current} and ${branchInfo.tracking} share no commit).`
+                    );
+                }
+                if (bases.length > 1) {
+                    // Picking one base could silently undo a resolution made
+                    // on either side (criss-cross merges).
+                    throw new Error(
+                        `Cannot pull: ${branchInfo.current} and ${branchInfo.tracking} have ${bases.length} merge bases. Merge them on a device with Git.`
+                    );
+                }
                 const merge = await mergeTrees(
                     repo,
-                    base ? await repo.commitTree(base) : undefined,
+                    await repo.commitTree(bases[0]!),
                     localTree,
                     await repo.commitTree(theirs),
                     {

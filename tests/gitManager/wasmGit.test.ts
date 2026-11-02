@@ -16,6 +16,7 @@ import { createWasmGitManager } from "../helpers/wasmGit";
 import { GitConflictError } from "../../src/types";
 import { nodeHttp, startGitHttpServer } from "../helpers/gitHttpServer";
 import { fetchRemote } from "../../src/gitManager/gitcore/remote";
+import { mergeText } from "../../src/gitManager/gitcore/merge";
 import { parseRemoteUrl } from "../../src/gitManager/gitcore/transport";
 import {
     PushRejectedError,
@@ -1817,5 +1818,151 @@ describe("WasmGit phase 4 review regressions", { timeout: 60_000 }, () => {
         } finally {
             await server.close();
         }
+    });
+});
+
+describe("WasmGit phase 5 review regressions", { timeout: 30_000 }, () => {
+    function puller(repo: TestRepo) {
+        const ctx = createWasmGitManager(repo.repoPath);
+        ctx.manager.fetch = () => Promise.resolve();
+        return ctx;
+    }
+    /** Diverge: run `ours` on main and `theirs` on a branch from the same base. */
+    async function diverge(
+        repo: TestRepo,
+        ours: () => Promise<void>,
+        theirs: () => Promise<void>
+    ) {
+        await repo.git.checkoutLocalBranch("theirs");
+        await theirs();
+        const theirCommit = await repo.head();
+        await repo.git.checkout("main");
+        await ours();
+        await repo.raw(["update-ref", "refs/remotes/origin/main", theirCommit]);
+    }
+    const snapshot = async (repo: TestRepo) =>
+        `${await repo.head()}\n${await repo.git.raw(["status", "--porcelain", "-uall"])}\n${await repo.raw(["ls-files", "-s"])}`;
+
+    it("refuses file-vs-folder conflicts without touching the vault", async () => {
+        for (const [ours, theirs] of [
+            ["x", "x/a.md"],
+            ["x/a.md", "x"],
+        ] as const) {
+            const repo = withCleanup(await createRepoWithOrigin());
+            await diverge(
+                repo,
+                () => repo.writeAndCommit(ours, "ours\n", "ours"),
+                () => repo.writeAndCommit(theirs, "theirs\n", "theirs")
+            );
+            const before = await snapshot(repo);
+            await expect(puller(repo).manager.pull()).rejects.toThrow(
+                /file on one side and a folder/
+            );
+            expect(await snapshot(repo)).toBe(before);
+            expect(readFileSync(path.join(repo.repoPath, ours), "utf8")).toBe(
+                "ours\n"
+            );
+        }
+    });
+
+    it("refuses when a folder replaces a file we modified", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.writeAndCommit("topic", "base\n", "topic file");
+        await diverge(
+            repo,
+            () => repo.writeAndCommit("topic", "ours\n", "we edit"),
+            async () => {
+                await repo.git.rm("topic");
+                await repo.writeAndCommit("topic/a.md", "a\n", "folder");
+            }
+        );
+        const before = await snapshot(repo);
+        await expect(puller(repo).manager.pull()).rejects.toThrow(/folder/);
+        expect(await snapshot(repo)).toBe(before);
+    });
+
+    it("refuses criss-cross merges and unrelated histories", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.writeAndCommit("n.md", "a\nX\nb\n", "base");
+        await repo.git.checkoutLocalBranch("B");
+        await repo.writeAndCommit("n.md", "a\nTWO\nb\n", "two");
+        await repo.git.checkout("main");
+        await repo.writeAndCommit("n.md", "a\nONE\nb\n", "one");
+        const a1 = await repo.head();
+        await repo.raw(["merge", "-q", "-s", "ours", "-m", "A takes B", "B"]);
+        await repo.git.checkout("B");
+        await repo.raw(["merge", "-q", "-s", "ours", "-m", "B takes A", a1]);
+        await repo.writeAndCommit("other.md", "o\n", "more B");
+        const b = await repo.head();
+        await repo.git.checkout("main");
+        await repo.raw(["update-ref", "refs/remotes/origin/main", b]);
+        await expect(puller(repo).manager.pull()).rejects.toThrow(
+            /merge bases/
+        );
+        expect(readFileSync(path.join(repo.repoPath, "n.md"), "utf8")).toBe(
+            "a\nONE\nb\n"
+        );
+
+        const unrelated = withCleanup(await createRepoWithOrigin());
+        const orphan = execFileSync(
+            "sh",
+            [
+                "-c",
+                "git checkout -q --orphan lonely && echo x > lonely.md && git add -A && git commit -qm lonely && git rev-parse HEAD && git checkout -q -f main",
+            ],
+            { cwd: unrelated.repoPath, encoding: "utf8" }
+        ).trim();
+        await unrelated.raw(["update-ref", "refs/remotes/origin/main", orphan]);
+        await expect(puller(unrelated).manager.pull()).rejects.toThrow(
+            /unrelated histories/
+        );
+    });
+
+    it("keeps every byte in clean text merges", () => {
+        const labels = { ours: "HEAD", theirs: "theirs" };
+        for (const special of ["mid dle", "old\rmac", "line\r\r\n", "﻿bom"]) {
+            // Edits far enough apart not to touch, as in git merge-file.
+            const base = `${special}\nx\nk1\nk2\ny\n`;
+            const ours = `${special}\nX\nk1\nk2\ny\n`;
+            const theirs = `${special}\nx\nk1\nk2\nY\n`;
+            expect(mergeText(base, ours, theirs, "none", labels)).toEqual({
+                clean: true,
+                text: `${special}\nX\nk1\nk2\nY\n`,
+            });
+        }
+    });
+
+    it("treats files that are not UTF-8 as binary when merging", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const latin1 = (s: string) => Buffer.from(s, "latin1");
+        writeFileSync(
+            path.join(repo.repoPath, "l.txt"),
+            latin1("caf\xe9\nx\ny\n")
+        );
+        await repo.raw(["add", "l.txt"]);
+        await repo.git.commit("latin1");
+        await diverge(
+            repo,
+            async () => {
+                writeFileSync(
+                    path.join(repo.repoPath, "l.txt"),
+                    latin1("caf\xe9\nX\ny\n")
+                );
+                await repo.raw(["commit", "-qam", "ours"]);
+            },
+            async () => {
+                writeFileSync(
+                    path.join(repo.repoPath, "l.txt"),
+                    latin1("caf\xe9\nx\nY\n")
+                );
+                await repo.raw(["commit", "-qam", "theirs"]);
+            }
+        );
+        await expect(puller(repo).manager.pull()).rejects.toBeInstanceOf(
+            GitConflictError
+        );
+        expect([...readFileSync(path.join(repo.repoPath, "l.txt"))]).toEqual([
+            ...latin1("caf\xe9\nX\ny\n"),
+        ]);
     });
 });

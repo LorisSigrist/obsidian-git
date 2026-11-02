@@ -65,3 +65,9 @@ Object.defineProperty(globalThis, "activeDocument", {
 });
 
 export {};
+
+// Keep tests independent of the developer's git setup: a global
+// `commit.gpgsign=true` (or hooks, templates) makes every fixture commit slow
+// or interactive. Fixtures configure the identity they need per repository.
+process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+process.env.GIT_CONFIG_NOSYSTEM = "1";

@@ -1,6 +1,7 @@
 // Three-way merge of trees, with line-based content merges for text files.
 
 import diff3Merge from "diff3";
+import { UnsupportedError } from "./errors";
 import { MODE_TREE, serializeTree, type TreeEntry } from "./model";
 import type { FlatEntry, Repository } from "./repository";
 
@@ -22,8 +23,18 @@ export interface TreeMergeResult {
 }
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-const LINES = /^.*(\r?\n|$)/gm;
+
+/** Strict and BOM-preserving, so a text merge never alters bytes it keeps. */
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/** Decode UTF-8 text, or undefined when the bytes are not valid UTF-8. */
+function decodeText(data: Uint8Array): string | undefined {
+    try {
+        return decoder.decode(data);
+    } catch {
+        return undefined;
+    }
+}
 
 function same(a?: FlatEntry, b?: FlatEntry): boolean {
     if (!a || !b) return a === b;
@@ -34,10 +45,15 @@ function isBinary(data: Uint8Array): boolean {
     return data.subarray(0, 8000).includes(0);
 }
 
+/** Split after every "\n", keeping each line's terminator and every other byte. */
 function lines(text: string): string[] {
-    const out = text.match(LINES) ?? [];
-    // The regex yields a trailing empty match at the end of the text.
-    if (out.length > 0 && out[out.length - 1] === "") out.pop();
+    const out: string[] = [];
+    let start = 0;
+    for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", start)) {
+        out.push(text.slice(start, i + 1));
+        start = i + 1;
+    }
+    if (start < text.length) out.push(text.slice(start));
     return out;
 }
 
@@ -111,7 +127,10 @@ export async function mergeTrees(
                 repo.objects.readTyped(te.oid, "blob"),
             ]);
             const mode = oe.mode === be?.mode ? te.mode : oe.mode;
-            if (isBinary(bd) || isBinary(od) || isBinary(td)) {
+            const texts = [bd, od, td].map((d) =>
+                isBinary(d) ? undefined : decodeText(d)
+            );
+            if (texts.some((t) => t === undefined)) {
                 if (opts.strategy === "ours") result = oe;
                 else if (opts.strategy === "theirs") result = te;
                 else {
@@ -127,9 +146,9 @@ export async function mergeTrees(
                 }
             } else {
                 const m = mergeText(
-                    decoder.decode(bd),
-                    decoder.decode(od),
-                    decoder.decode(td),
+                    texts[0]!,
+                    texts[1]!,
+                    texts[2]!,
                     opts.strategy,
                     opts.labels
                 );
@@ -168,22 +187,20 @@ export async function mergeTrees(
         if (result) merged.set(path, result);
     }
 
-    // A file on one side where the other has a folder cannot be merged.
+    // A file on one side where the other has a folder: git would rename one
+    // of them, which this implementation does not do. Refuse before anything
+    // is written rather than drop either side.
     const dirs = new Set<string>();
     for (const p of merged.keys()) {
         const parts = p.split("/");
         for (let i = 1; i < parts.length; i++)
             dirs.add(parts.slice(0, i).join("/"));
     }
-    for (const p of [...merged.keys()]) {
-        if (dirs.has(p) && !conflicts.some((c) => c.path === p)) {
-            conflicts.push({
-                path: p,
-                base: b.get(p),
-                ours: o.get(p),
-                theirs: t.get(p),
-            });
-        }
+    const clashes = [...merged.keys()].filter((p) => dirs.has(p));
+    if (clashes.length > 0) {
+        throw new UnsupportedError(
+            `Cannot merge: ${clashes.join(", ")} is a file on one side and a folder on the other. Resolve this on a device with Git.`
+        );
     }
     return { merged, conflicts };
 }
