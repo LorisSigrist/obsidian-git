@@ -5,6 +5,7 @@ import {
     readdir,
     rename,
     rm,
+    rmdir as rmdirFs,
     stat,
     writeFile,
 } from "fs/promises";
@@ -79,8 +80,11 @@ export function createNodeVault(root: string) {
         },
         mkdir: (vaultPath: string) =>
             mkdir(resolve(vaultPath), { recursive: true }),
+        // Like Obsidian: non-recursive rmdir removes an empty folder.
         rmdir: (vaultPath: string, recursive = false) =>
-            rm(resolve(vaultPath), { recursive, force: true }),
+            recursive
+                ? rm(resolve(vaultPath), { recursive, force: true })
+                : rmdirFs(resolve(vaultPath)),
         remove: (vaultPath: string) =>
             rm(resolve(vaultPath), { recursive: true, force: true }),
         appendBinary: (vaultPath: string, data: ArrayBuffer) =>

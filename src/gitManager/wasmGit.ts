@@ -24,6 +24,8 @@ import type { GitIndex } from "./gitcore/gitIndex";
 import type { Person } from "./gitcore/model";
 import type { RangeReader } from "./gitcore/repoFs";
 import { Repository, type StatusRow } from "./gitcore/repository";
+import { checkoutTree } from "./gitcore/checkout";
+import { isAncestor } from "./gitcore/history";
 import {
     cleanMessage,
     person,
@@ -53,6 +55,45 @@ function isoDate(p: Person): string {
             ? "Z"
             : `${p.timezone.slice(0, 3)}:${p.timezone.slice(3, 5)}`)
     );
+}
+
+/**
+ * A local branch name for `remote/branch` that does not collide with existing
+ * ones: `branch`, then `branch-remote`, then `branch-remote-1`, ... (as the
+ * native backend chooses).
+ */
+function availableBranchName(
+    branch: string,
+    remote: string,
+    existing: string[]
+): string {
+    if (!existing.includes(branch)) return branch;
+    const base = `${branch}-${remote}`;
+    let candidate = base;
+    for (let n = 1; existing.includes(candidate); n++) {
+        candidate = `${base}-${n}`;
+    }
+    return candidate;
+}
+
+/** Reject names `git check-ref-format --branch` would refuse. */
+function assertBranchName(name: string): void {
+    const invalid =
+        name === "" ||
+        name === "@" ||
+        name === "HEAD" ||
+        name.startsWith("-") ||
+        name.startsWith("/") ||
+        name.endsWith("/") ||
+        name.endsWith(".") ||
+        name.endsWith(".lock") ||
+        name.includes("..") ||
+        name.includes("//") ||
+        name.includes("@{") ||
+        // eslint-disable-next-line no-control-regex
+        /[\x00-\x20\x7f~^:?*[\\]/.test(name) ||
+        name.split("/").some((part) => part.startsWith("."));
+    if (invalid) throw new Error(`'${name}' is not a valid branch name.`);
 }
 
 /**
@@ -327,10 +368,6 @@ export class WasmGit extends GitManager {
             (await this.resolveRef(current)) !=
             (await this.resolveRef(tracking))
         );
-    }
-
-    branchIsMerged(_: string): Promise<boolean> {
-        return Promise.resolve(true);
     }
 
     async log(
@@ -737,6 +774,157 @@ export class WasmGit extends GitManager {
         }
     }
 
+    // ---- Branches and remotes ----
+
+    /** Move the working tree, index and HEAD to `ref` (a full ref name or oid). */
+    private async switchTo(target: string, headRef: string | undefined) {
+        await this.withIndex(true, async (repo, index, mtime) => {
+            const oid = await repo.resolveCommit(target);
+            const from = (await repo.headOid())
+                ? await repo.commitTree("HEAD")
+                : undefined;
+            await checkoutTree(
+                repo,
+                index,
+                mtime,
+                await repo.ignoreRules(),
+                from,
+                (await repo.objects.readCommit(oid)).tree
+            );
+            if (headRef) await repo.refs.writeSymbolic("HEAD", headRef);
+            else await repo.refs.write("HEAD", oid);
+        });
+    }
+
+    async checkout(branch: string, remote?: string): Promise<void> {
+        return this.withGitOperation(GitOperation.checkout, async () => {
+            const repo = await this.repo();
+            const branches = await repo.refs.list("refs/heads/");
+            if (!remote) {
+                if (branches.includes(branch)) {
+                    return this.switchTo(
+                        `refs/heads/${branch}`,
+                        `refs/heads/${branch}`
+                    );
+                }
+                // Like `git checkout <name>`: create a tracking branch when
+                // exactly one remote has a branch of that name.
+                const candidates: string[] = [];
+                for (const r of await this.getRemotes()) {
+                    if (
+                        (await repo.refs.readRaw(
+                            `refs/remotes/${r}/${branch}`
+                        )) !== null
+                    )
+                        candidates.push(r);
+                }
+                if (candidates.length !== 1) {
+                    throw new NotFoundError(`branch ${branch}`);
+                }
+                remote = candidates[0]!;
+            }
+            const remoteBranch = `${remote}/${branch}`;
+            const config = await repo.readConfig();
+            const tracksRemote =
+                branches.includes(branch) &&
+                config.get(`branch.${branch}.remote`) === remote &&
+                config.get(`branch.${branch}.merge`) === `refs/heads/${branch}`;
+            if (tracksRemote) {
+                return this.switchTo(
+                    `refs/heads/${branch}`,
+                    `refs/heads/${branch}`
+                );
+            }
+            const local = availableBranchName(branch, remote, branches);
+            const tip = await repo.resolveCommit(
+                `refs/remotes/${remoteBranch}`
+            );
+            // Switch first: if local changes block it, nothing is created.
+            await this.switchTo(tip, undefined);
+            await repo.refs.write(`refs/heads/${local}`, tip);
+            await repo.refs.writeSymbolic("HEAD", `refs/heads/${local}`);
+            config.set(`branch.${local}.remote`, remote);
+            config.set(`branch.${local}.merge`, `refs/heads/${branch}`);
+            await repo.writeConfig(config);
+        });
+    }
+
+    async createBranch(branch: string): Promise<void> {
+        assertBranchName(branch);
+        const repo = await this.repo();
+        if ((await repo.refs.readRaw(`refs/heads/${branch}`)) !== null) {
+            throw new Error(`A branch named '${branch}' already exists.`);
+        }
+        const head = await repo.headOid();
+        if (head) await repo.refs.write(`refs/heads/${branch}`, head);
+        await repo.refs.writeSymbolic("HEAD", `refs/heads/${branch}`);
+    }
+
+    async deleteBranch(branch: string, force: boolean): Promise<void> {
+        const repo = await this.repo();
+        const ref = `refs/heads/${branch}`;
+        const tip = await repo.refs.resolveFull(ref);
+        if (!tip) throw new NotFoundError(`branch ${branch}`);
+        if ((await repo.refs.currentBranch()) === branch) {
+            throw new Error(
+                `Cannot delete branch '${branch}' checked out in the vault.`
+            );
+        }
+        if (!force && !(await this.branchIsMerged(branch))) {
+            throw new Error(
+                `The branch '${branch}' is not fully merged. Delete it with force to discard its commits.`
+            );
+        }
+        await repo.refs.delete(ref);
+        const config = await repo.readConfig();
+        config.removeSection("branch", branch);
+        await repo.writeConfig(config);
+    }
+
+    /** Whether the branch tip is contained in HEAD (`git branch --merged`). */
+    async branchIsMerged(branch: string): Promise<boolean> {
+        const repo = await this.repo();
+        const tip = await repo.refs.resolveFull(`refs/heads/${branch}`);
+        const head = await repo.headOid();
+        if (!tip || !head) return false;
+        return isAncestor(repo, tip, head);
+    }
+
+    async setRemote(name: string, url: string): Promise<void> {
+        const repo = await this.repo();
+        const config = await repo.readConfig();
+        if (!config.subsections("remote").includes(name)) {
+            config.set(
+                `remote.${name}.fetch`,
+                `+refs/heads/*:refs/remotes/${name}/*`
+            );
+        }
+        config.set(`remote.${name}.url`, url);
+        await repo.writeConfig(config);
+    }
+
+    async removeRemote(remoteName: string): Promise<void> {
+        const repo = await this.repo();
+        const config = await repo.readConfig();
+        if (!config.subsections("remote").includes(remoteName)) {
+            throw new NotFoundError(`remote ${remoteName}`);
+        }
+        config.removeSection("remote", remoteName);
+        // Like `git remote remove`: forget upstreams pointing at it.
+        for (const branch of config.subsections("branch")) {
+            if (config.get(`branch.${branch}.remote`) === remoteName) {
+                config.set(`branch.${branch}.remote`, undefined);
+                config.set(`branch.${branch}.merge`, undefined);
+            }
+        }
+        await repo.writeConfig(config);
+        for (const name of await repo.refs.list(
+            `refs/remotes/${remoteName}/`
+        )) {
+            await repo.refs.delete(`refs/remotes/${remoteName}/${name}`);
+        }
+    }
+
     // ---- Not yet implemented (later phases) ----
 
     private notYet(name: string): never {
@@ -749,15 +937,6 @@ export class WasmGit extends GitManager {
     push(): Promise<PushResult> {
         this.notYet("push");
     }
-    checkout(_: string, __?: string): Promise<void> {
-        this.notYet("checkout");
-    }
-    createBranch(_: string): Promise<void> {
-        this.notYet("createBranch");
-    }
-    deleteBranch(_: string, __: boolean): Promise<void> {
-        this.notYet("deleteBranch");
-    }
     init(): Promise<void> {
         this.notYet("init");
     }
@@ -766,12 +945,6 @@ export class WasmGit extends GitManager {
     }
     fetch(_?: string): Promise<void> {
         this.notYet("fetch");
-    }
-    setRemote(_: string, __: string): Promise<void> {
-        this.notYet("setRemote");
-    }
-    removeRemote(_: string): Promise<void> {
-        this.notYet("removeRemote");
     }
     updateUpstreamBranch(_: string): Promise<void> {
         this.notYet("updateUpstreamBranch");
