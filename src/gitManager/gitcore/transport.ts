@@ -147,7 +147,10 @@ export function parseRemoteUrl(url: string): {
 } {
     const m = /^(https?:\/\/)([^@/]+)@(.*)$/.exec(url);
     if (!m) return { url };
-    const [user, pass] = m[2]!.split(":");
+    // Only the first colon separates user from password.
+    const colon = m[2]!.indexOf(":");
+    const user = colon < 0 ? m[2]! : m[2]!.slice(0, colon);
+    const pass = colon < 0 ? undefined : m[2]!.slice(colon + 1);
     return {
         url: m[1]! + m[3]!,
         credentials: {

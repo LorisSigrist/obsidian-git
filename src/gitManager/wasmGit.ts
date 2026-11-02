@@ -1169,13 +1169,15 @@ export class WasmGit extends GitManager {
             localRef: `refs/heads/${branch}`,
             remoteRef,
         });
-        const tip = await repo.refs.resolveFull(`refs/heads/${branch}`);
+        // Record what was pushed, not the branch tip now: a commit made
+        // during the push has not reached the remote.
         const tracking = remoteRef.replace(
             /^refs\/heads\//,
             `refs/remotes/${remote}/`
         );
-        if (tip && tracking !== remoteRef) await repo.refs.write(tracking, tip);
-        return outcome;
+        if (tracking !== remoteRef)
+            await repo.refs.write(tracking, outcome.oid);
+        return outcome.status;
     }
 
     async updateUpstreamBranch(remoteBranch: string): Promise<void> {

@@ -1,6 +1,6 @@
 import { execFileSync } from "child_process";
 import { randomBytes } from "crypto";
-import { chmodSync, readFileSync, writeFileSync } from "fs";
+import { chmodSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
 import { describe, expect, it } from "vitest";
 import type { WasmGit } from "../../src/gitManager/wasmGit";
@@ -16,6 +16,7 @@ import { createWasmGitManager } from "../helpers/wasmGit";
 import { GitConflictError } from "../../src/types";
 import { nodeHttp, startGitHttpServer } from "../helpers/gitHttpServer";
 import { fetchRemote } from "../../src/gitManager/gitcore/remote";
+import { parseRemoteUrl } from "../../src/gitManager/gitcore/transport";
 import {
     PushRejectedError,
     UserCanceledError,
@@ -1689,6 +1690,130 @@ describe("WasmGit pull and merge", { timeout: 30_000 }, () => {
                 status: "pushed",
             });
             await expectFsckClean(repo);
+        } finally {
+            await server.close();
+        }
+    });
+});
+
+describe("WasmGit phase 4 review regressions", { timeout: 60_000 }, () => {
+    it("fetches only new objects after many unpushed local commits", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        for (let i = 0; i < 20; i++) {
+            await repo.appendAndCommit("note.md", `${i}\n`, `history ${i}`);
+        }
+        await repo.git.push(["--quiet"]);
+        // 300 local commits that are not pushed, made in one fast-import.
+        const head = await repo.head();
+        let stream = "";
+        for (let i = 0; i < 300; i++) {
+            const msg = `local${i}`;
+            stream +=
+                `commit refs/heads/main\n` +
+                `committer L <l@x> ${1_900_000_000 + i} +0000\n` +
+                `data ${msg.length}\n${msg}\n` +
+                (i === 0 ? `from ${head}\n` : "") +
+                "\n";
+        }
+        execFileSync("git", ["fast-import", "--quiet", "--force"], {
+            cwd: repo.repoPath,
+            input: stream,
+        });
+        // One new remote commit with one new file.
+        const other = path.join(repo.dir, "other");
+        execFileSync("git", ["clone", "-q", repo.remotePath, other]);
+        writeFileSync(path.join(other, "new.md"), "new\n");
+        execFileSync("git", ["add", "."], { cwd: other });
+        execFileSync(
+            "git",
+            [
+                "-c",
+                "user.name=O",
+                "-c",
+                "user.email=o@x",
+                "commit",
+                "-qm",
+                "remote",
+            ],
+            { cwd: other }
+        );
+        execFileSync("git", ["push", "-q", "origin", "main"], { cwd: other });
+
+        const server = await startGitHttpServer(repo.dir);
+        try {
+            const r = await repoOf(managerFor(repo));
+            await repo.raw(["gc", "--quiet"]);
+            const packDir = path.join(repo.repoPath, ".git", "objects", "pack");
+            const before = new Set(readdirSync(packDir));
+            await fetchRemote(r, {
+                url: server.url("remote.git"),
+                http: nodeHttp,
+                remote: "origin",
+                refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+            });
+            const added = readdirSync(packDir).filter(
+                (f) => f.endsWith(".idx") && !before.has(f)
+            );
+            expect(added).toHaveLength(1);
+            const objects = execFileSync("git", ["show-index"], {
+                input: readFileSync(path.join(packDir, added[0]!)),
+                encoding: "utf8",
+            })
+                .trim()
+                .split("\n");
+            // The commit, its tree and the new blob.
+            expect(objects).toHaveLength(3);
+        } finally {
+            await server.close();
+        }
+    });
+
+    it("keeps everything after the first colon as the password", () => {
+        expect(parseRemoteUrl("https://user:pa:ss@host/x.git")).toEqual({
+            url: "https://host/x.git",
+            credentials: { username: "user", password: "pa:ss" },
+        });
+    });
+
+    it("pushes a complete set of objects across merges and long history", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const server = await startGitHttpServer(repo.dir);
+        try {
+            await repo.raw([
+                "remote",
+                "set-url",
+                "origin",
+                server.url("remote.git"),
+            ]);
+            for (let i = 0; i < 40; i++) {
+                await repo.appendAndCommit("note.md", `${i}\n`, `c${i}`);
+            }
+            await repo.raw(["checkout", "-q", "-b", "side", "HEAD~20"]);
+            await repo.writeAndCommit("side/s.md", "side\n", "side work");
+            await repo.raw(["checkout", "-q", "main"]);
+            await repo.raw([
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "merge side",
+                "side",
+            ]);
+            const ctx = createWasmGitManager(repo.repoPath);
+            ctx.manager.http = nodeHttp;
+            ctx.plugin.settings.disablePopups = true;
+            await expect(ctx.manager.push()).resolves.toMatchObject({
+                status: "pushed",
+            });
+            execFileSync("git", ["fsck", "--strict", "--no-dangling"], {
+                cwd: repo.remotePath,
+            });
+            expect(
+                execFileSync("git", ["rev-parse", "main"], {
+                    cwd: repo.remotePath,
+                    encoding: "utf8",
+                }).trim()
+            ).toBe(await repo.head());
         } finally {
             await server.close();
         }

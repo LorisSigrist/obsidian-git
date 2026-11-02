@@ -69,34 +69,50 @@ async function writeShallow(repo: Repository, oids: Set<string>) {
     else await repo.fs.write(path, [...oids].sort().join("\n") + "\n");
 }
 
-/** Commits we have, newest first, to tell the server what not to send. */
+/**
+ * Commits to tell the server we have: every remote-tracking and tag tip
+ * first (the likely common commits, however many local commits are
+ * unpushed), then other recent commits, newest first, up to `limit`.
+ */
 async function haves(repo: Repository, limit = 256): Promise<string[]> {
-    const tips = new Set<string>();
-    for (const prefix of ["refs/heads/", "refs/remotes/", "refs/tags/"]) {
+    const isCommit = async (oid: string | null) =>
+        !!oid &&
+        (await repo.objects.has(oid)) &&
+        (await repo.objects.read(oid)).type === "commit";
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const prefix of ["refs/remotes/", "refs/tags/"]) {
         for (const name of await repo.refs.list(prefix)) {
             const oid = await repo.refs.resolveFull(prefix + name);
-            if (oid && (await repo.objects.has(oid))) tips.add(oid);
+            if (oid && !seen.has(oid) && (await isCommit(oid))) {
+                seen.add(oid);
+                out.push(oid);
+            }
         }
     }
-    const out: string[] = [];
     const queue: { oid: string; time: number }[] = [];
-    const seen = new Set<string>();
-    const push = async (oid: string) => {
-        if (seen.has(oid) || !(await repo.objects.has(oid))) return;
+    const push = async (oid: string | null) => {
+        if (!oid || seen.has(oid) || !(await isCommit(oid))) return;
         seen.add(oid);
-        const obj = await repo.objects.read(oid);
-        if (obj.type !== "commit") return;
         const c = await repo.objects.readCommit(oid);
         queue.push({ oid, time: c.committer.timestamp });
     };
-    for (const t of tips) await push(t);
-    while (queue.length > 0 && out.length < limit) {
-        queue.sort((a, b) => b.time - a.time);
-        const { oid } = queue.shift()!;
-        out.push(oid);
-        for (const p of (await repo.objects.readCommit(oid)).parents) {
+    for (const name of await repo.refs.list("refs/heads/")) {
+        await push(await repo.refs.resolveFull(`refs/heads/${name}`));
+    }
+    for (const oid of [...out]) {
+        for (const p of (await repo.objects.readCommit(oid)).parents)
             await push(p);
+    }
+    while (queue.length > 0 && out.length < limit) {
+        let best = 0;
+        for (let i = 1; i < queue.length; i++) {
+            if (queue[i]!.time > queue[best]!.time) best = i;
         }
+        const { oid } = queue.splice(best, 1)[0]!;
+        out.push(oid);
+        for (const p of (await repo.objects.readCommit(oid)).parents)
+            await push(p);
     }
     return out;
 }
@@ -148,11 +164,15 @@ export async function storePack(
             // The pack goes first: an index without its pack would be broken.
             await repo.fs.rename(tmp, `${dir}/${name}.pack`);
         }
-        await repo.fs.write(`${dir}/${name}.idx`, idx);
+        // Written aside and renamed, so a crash cannot leave a truncated index.
+        await repo.fs.write(`${tmp}.idx`, idx);
+        await repo.fs.remove(`${dir}/${name}.idx`);
+        await repo.fs.rename(`${tmp}.idx`, `${dir}/${name}.idx`);
         repo.objects.invalidatePacks();
         return count;
     } catch (e) {
         await repo.fs.remove(tmp).catch(() => undefined);
+        await repo.fs.remove(`${tmp}.idx`).catch(() => undefined);
         throw e;
     } finally {
         ix.free();
@@ -328,56 +348,60 @@ async function allTreeObjects(
     }
 }
 
-/** The objects a remote that has `remoteTips` needs to get to `tip`. */
+/**
+ * The objects a remote that has `remoteTips` needs to get to `tip`.
+ *
+ * Commits are found like `git rev-list tip --not remoteTips`: a walk in
+ * commit-date order from both sides that stops once only remote-side commits
+ * are left, so it does not visit the remote's whole history. Clock skew can
+ * only make it send extra objects, never too few.
+ */
 async function objectsToSend(
     repo: Repository,
     tip: string,
     remoteTips: string[]
 ): Promise<string[]> {
-    // Commits the remote has (that we know of).
-    const known = new Set<string>();
-    const stack: string[] = [];
-    for (const t of remoteTips) {
-        if (t !== ZERO && (await repo.objects.has(t))) {
-            const obj = await repo.objects.read(t);
-            if (obj.type === "commit" && !known.has(t)) {
-                known.add(t);
-                stack.push(t);
+    /** oid → true when the remote has it ("uninteresting"). */
+    const remoteHas = new Map<string, boolean>();
+    const queue: { oid: string; time: number }[] = [];
+    const add = async (oid: string, remote: boolean) => {
+        const known = remoteHas.get(oid);
+        if (known === true || (known === false && !remote)) return;
+        if (!(await repo.objects.has(oid))) return;
+        if ((await repo.objects.read(oid)).type !== "commit") return;
+        remoteHas.set(oid, remote);
+        const time = (await repo.objects.readCommit(oid)).committer.timestamp;
+        // Re-queued when it turns out the remote has it, to pass that on.
+        queue.push({ oid, time });
+    };
+    await add(tip, false);
+    for (const t of remoteTips) if (t !== ZERO) await add(t, true);
+    while (queue.some((q) => remoteHas.get(q.oid) === false)) {
+        let best = 0;
+        for (let i = 1; i < queue.length; i++) {
+            if (queue[i]!.time > queue[best]!.time) best = i;
+        }
+        const { oid } = queue.splice(best, 1)[0]!;
+        const remote = remoteHas.get(oid)!;
+        for (const p of (await repo.objects.readCommit(oid)).parents) {
+            await add(p, remote);
+        }
+    }
+    const commits = [...remoteHas]
+        .filter(([, remote]) => !remote)
+        .map(([oid]) => oid);
+    // Trees and blobs of the remote-side commits the new ones build on.
+    const have = new Set<string>();
+    for (const c of commits) {
+        for (const p of (await repo.objects.readCommit(c)).parents) {
+            if (remoteHas.get(p) === true) {
+                await allTreeObjects(
+                    repo,
+                    (await repo.objects.readCommit(p)).tree,
+                    have
+                );
             }
         }
-    }
-    while (stack.length > 0) {
-        for (const p of (await repo.objects.readCommit(stack.pop()!)).parents) {
-            if (known.has(p) || !(await repo.objects.has(p))) continue;
-            known.add(p);
-            stack.push(p);
-        }
-    }
-    // New commits, and the remote-side commits they build on.
-    const commits: string[] = [];
-    const boundary = new Set<string>();
-    const seen = new Set<string>([tip]);
-    const walk = [tip];
-    while (walk.length > 0) {
-        const oid = walk.pop()!;
-        if (known.has(oid)) {
-            boundary.add(oid);
-            continue;
-        }
-        commits.push(oid);
-        for (const p of (await repo.objects.readCommit(oid)).parents) {
-            if (seen.has(p) || !(await repo.objects.has(p))) continue;
-            seen.add(p);
-            walk.push(p);
-        }
-    }
-    const have = new Set<string>();
-    for (const b of boundary) {
-        await allTreeObjects(
-            repo,
-            (await repo.objects.readCommit(b)).tree,
-            have
-        );
     }
     const out = new Set<string>(commits);
     for (const c of commits) {
@@ -391,7 +415,11 @@ async function objectsToSend(
     return [...out];
 }
 
-export type PushOutcome = "up-to-date" | "pushed";
+export interface PushOutcome {
+    status: "up-to-date" | "pushed";
+    /** The commit the remote ref now points at. */
+    oid: string;
+}
 
 /**
  * Push local ref `localRef` to `remoteRef` on the remote (fast-forward only
@@ -412,7 +440,7 @@ export async function pushRef(
     if (!next)
         throw new Error(`Nothing to push: ${opts.localRef} does not exist`);
     const old = remoteRefs.refs.get(opts.remoteRef) ?? ZERO;
-    if (old === next) return "up-to-date";
+    if (old === next) return { status: "up-to-date", oid: next };
     if (old !== ZERO && !opts.force) {
         if (!(await repo.objects.has(old))) {
             throw new PushRejectedError(
@@ -486,5 +514,5 @@ export async function pushRef(
             );
         }
     }
-    return "pushed";
+    return { status: "pushed", oid: next };
 }
