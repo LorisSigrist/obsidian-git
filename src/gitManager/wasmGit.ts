@@ -115,7 +115,7 @@ function assertBranchName(name: string): void {
         name.startsWith("/") ||
         name.endsWith("/") ||
         name.endsWith(".") ||
-        name.endsWith(".lock") ||
+        name.split("/").some((part) => part.endsWith(".lock")) ||
         name.includes("..") ||
         name.includes("//") ||
         name.includes("@{") ||
@@ -889,13 +889,25 @@ export class WasmGit extends GitManager {
                 );
             }
             const local = availableBranchName(branch, remote, branches);
+            const localRef = `refs/heads/${local}`;
             const tip = await repo.resolveCommit(
                 `refs/remotes/${remoteBranch}`
             );
-            // Switch first: if local changes block it, nothing is created.
-            await this.switchTo(tip, undefined);
-            await repo.refs.write(`refs/heads/${local}`, tip);
-            await repo.refs.writeSymbolic("HEAD", `refs/heads/${local}`);
+            const clash = await repo.refs.clash(localRef);
+            if (clash) {
+                throw new Error(
+                    `Cannot create branch '${local}' because '${clash}' exists.`
+                );
+            }
+            // Create the branch, then switch; if local changes block the
+            // switch, remove it again so nothing has changed.
+            await repo.refs.write(localRef, tip);
+            try {
+                await this.switchTo(localRef, localRef);
+            } catch (e) {
+                await repo.refs.delete(localRef);
+                throw e;
+            }
             config.set(`branch.${local}.remote`, remote);
             config.set(`branch.${local}.merge`, `refs/heads/${branch}`);
             await repo.writeConfig(config);
@@ -907,6 +919,12 @@ export class WasmGit extends GitManager {
         const repo = await this.repo();
         if ((await repo.refs.readRaw(`refs/heads/${branch}`)) !== null) {
             throw new Error(`A branch named '${branch}' already exists.`);
+        }
+        const clash = await repo.refs.clash(`refs/heads/${branch}`);
+        if (clash) {
+            throw new Error(
+                `Cannot create branch '${branch}' because '${clash}' exists.`
+            );
         }
         const head = await repo.headOid();
         if (head) await repo.refs.write(`refs/heads/${branch}`, head);
@@ -934,13 +952,27 @@ export class WasmGit extends GitManager {
         await repo.writeConfig(config);
     }
 
-    /** Whether the branch tip is contained in HEAD (`git branch --merged`). */
+    /**
+     * Whether the branch tip is contained in its upstream, or in HEAD when it
+     * has none: the check `git branch -d` makes before deleting.
+     */
     async branchIsMerged(branch: string): Promise<boolean> {
         const repo = await this.repo();
         const tip = await repo.refs.resolveFull(`refs/heads/${branch}`);
-        const head = await repo.headOid();
-        if (!tip || !head) return false;
-        return isAncestor(repo, tip, head);
+        if (!tip) return false;
+        const config = await repo.readConfig();
+        const remote = config.get(`branch.${branch}.remote`);
+        const merge = config.get(`branch.${branch}.merge`);
+        let target: string | undefined;
+        if (remote && merge?.startsWith("refs/heads/")) {
+            target =
+                (await repo.refs.resolveFull(
+                    `refs/remotes/${remote}/${merge.slice("refs/heads/".length)}`
+                )) ?? undefined;
+        }
+        target ??= await repo.headOid();
+        if (!target) return false;
+        return isAncestor(repo, tip, target);
     }
 
     async setRemote(name: string, url: string): Promise<void> {
@@ -969,6 +1001,12 @@ export class WasmGit extends GitManager {
                 config.set(`branch.${branch}.remote`, undefined);
                 config.set(`branch.${branch}.merge`, undefined);
             }
+            if (config.get(`branch.${branch}.pushRemote`) === remoteName) {
+                config.set(`branch.${branch}.pushRemote`, undefined);
+            }
+        }
+        if (config.get("remote.pushDefault") === remoteName) {
+            config.set("remote.pushDefault", undefined);
         }
         await repo.writeConfig(config);
         for (const name of await repo.refs.list(

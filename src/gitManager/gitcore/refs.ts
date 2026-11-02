@@ -95,6 +95,20 @@ export class Refs {
         return raw?.startsWith("ref:") ? raw.slice(4).trim() : undefined;
     }
 
+    /**
+     * An existing ref that would make `ref` impossible to create: one of its
+     * parents (`refs/heads/a` blocks `refs/heads/a/b`) or a ref below it.
+     */
+    async clash(ref: string): Promise<string | undefined> {
+        const parts = ref.split("/");
+        for (let i = 2; i < parts.length; i++) {
+            const parent = parts.slice(0, i).join("/");
+            if ((await this.readRaw(parent)) !== null) return parent;
+        }
+        const below = await this.list(ref + "/");
+        return below.length > 0 ? `${ref}/${below[0]}` : undefined;
+    }
+
     async write(ref: string, oid: string): Promise<void> {
         if (!OID.test(oid)) throw new Error(`Invalid oid ${oid} for ${ref}`);
         await this.fs.write(`${this.gitdir}/${ref}`, `${oid}\n`);

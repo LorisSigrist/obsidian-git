@@ -11,10 +11,11 @@ import { settledStat } from "./worktree";
 
 /** Local changes or untracked files that a checkout would overwrite. */
 export class CheckoutConflictError extends GitError {
-    constructor(readonly filepaths: string[]) {
-        super(
-            `Your local changes to the following files would be overwritten by checkout: ${filepaths.join(", ")}`
-        );
+    constructor(
+        readonly filepaths: string[],
+        reason = "your local changes to these files would be overwritten by checkout"
+    ) {
+        super(`Cannot check out: ${reason}: ${filepaths.join(", ")}`);
     }
 }
 
@@ -78,61 +79,114 @@ export async function checkoutTree(
         changes.map((c) => c.path)
     );
 
+    // Names that only differ in case refer to the same file on iOS, Android
+    // and macOS storage, so a case-only rename must not look like a collision.
+    const deletedFolded = new Set(
+        changes
+            .filter((c) => !toFlat.has(c.path))
+            .map((c) => c.path.toLowerCase())
+    );
+
     if (!opts.force) {
-        const blocked: string[] = [];
+        if (!opts.filepaths && index.conflicts.size > 0) {
+            throw new CheckoutConflictError(
+                [...index.conflicts.keys()].sort(),
+                "you need to resolve your current index first"
+            );
+        }
+        const blocked = new Set<string>();
         for (const { path } of changes) {
             const before = fromFlat.get(path);
+            const after = toFlat.get(path);
             const entry = index.entries.get(path);
             if (index.conflicts.has(path)) {
-                blocked.push(path);
+                blocked.add(path);
                 continue;
             }
             const indexClean = before
                 ? entry?.oid === before.oid
                 : entry === undefined;
             if (!indexClean) {
-                blocked.push(path);
+                blocked.add(path);
                 continue;
             }
-            const w = await repo.workdirOid(path, entry, indexMtime);
             if (before) {
                 // A tracked file must be unmodified (or already deleted).
-                if (w && w.oid !== before.oid) blocked.push(path);
-            } else if (w) {
-                // An untracked file is in the way, unless it is ignored or
-                // already identical to what we would write.
-                const after = toFlat.get(path);
-                if (w.oid !== after?.oid && !(await ignore.isIgnored(path)))
-                    blocked.push(path);
+                const w = await repo.workdirOid(path, entry, indexMtime);
+                if (w && w.oid !== before.oid) blocked.add(path);
+                continue;
+            }
+            if (!after || deletedFolded.has(path.toLowerCase())) continue;
+            // Something untracked may be in the way of the new file: a file,
+            // a folder with untracked files, or a file where a parent folder
+            // must go. Ignored files are replaced, as git does.
+            const stat = await repo.fs.stat(repo.vaultPath(path));
+            if (stat?.type === "file") {
+                const w = await repo.workdirOid(path, entry, indexMtime);
+                if (w && w.oid !== after.oid && !(await ignore.isIgnored(path)))
+                    blocked.add(path);
+            } else if (stat?.type === "folder") {
+                for (const f of await listAll(repo, path)) {
+                    if (!fromFlat.has(f) && !(await ignore.isIgnored(f)))
+                        blocked.add(path);
+                }
+            }
+            const parts = path.split("/");
+            for (let i = 1; i < parts.length; i++) {
+                const dir = parts.slice(0, i).join("/");
+                const s = await repo.fs.stat(repo.vaultPath(dir));
+                if (
+                    s?.type === "file" &&
+                    !fromFlat.has(dir) &&
+                    !(await ignore.isIgnored(dir))
+                )
+                    blocked.add(path);
             }
         }
-        if (blocked.length > 0) throw new CheckoutConflictError(blocked);
+        if (blocked.size > 0)
+            throw new CheckoutConflictError([...blocked].sort());
     }
 
+    // Deletions first: a folder being replaced by a file, or a case-only
+    // rename, needs the old entries gone before the new ones are written.
     const emptied = new Set<string>();
     for (const { path } of changes) {
+        if (toFlat.has(path)) continue;
+        await repo.fs.remove(repo.vaultPath(path));
+        index.entries.delete(path);
+        index.conflicts.delete(path);
+        const slash = path.lastIndexOf("/");
+        if (slash > 0) emptied.add(path.slice(0, slash));
+    }
+    await pruneEmptyDirs(repo, emptied);
+
+    for (const { path } of changes) {
         const after = toFlat.get(path);
+        if (!after) continue;
         const vaultPath = repo.vaultPath(path);
-        if (!after) {
-            await repo.fs.remove(vaultPath);
-            index.entries.delete(path);
-            index.conflicts.delete(path);
-            const slash = path.lastIndexOf("/");
-            if (slash > 0) emptied.add(path.slice(0, slash));
-            continue;
-        }
         if (after.mode === MODE_GITLINK || after.mode === MODE_SYMLINK) {
             // Not representable in a vault; keep the index in step only.
             index.entries.set(path, entryFor(path, after, null));
             continue;
         }
-        const data = await repo.objects.readTyped(after.oid, "blob");
-        const current = await repo.fs.read(vaultPath);
+        // Clear what the checks allowed to be replaced: leftover (ignored)
+        // content where the file goes, or a file where a folder must go.
+        const parts = path.split("/");
+        for (let i = 1; i < parts.length; i++) {
+            const dir = repo.vaultPath(parts.slice(0, i).join("/"));
+            if ((await repo.fs.stat(dir))?.type === "file") {
+                await repo.fs.remove(dir);
+            }
+        }
+        const stat = await repo.fs.stat(vaultPath);
+        if (stat?.type === "folder") await repo.fs.rmdir(vaultPath, true);
+        const current =
+            stat?.type === "file" ? await repo.fs.read(vaultPath) : null;
         if (!current || hash_object("blob", current) !== after.oid) {
-            // A directory may sit where the file goes (tree became blob).
-            const stat = await repo.fs.stat(vaultPath);
-            if (stat?.type === "folder") await repo.fs.rmdir(vaultPath, true);
-            await repo.fs.write(vaultPath, data);
+            await repo.fs.write(
+                vaultPath,
+                await repo.objects.readTyped(after.oid, "blob")
+            );
         }
         index.conflicts.delete(path);
         index.entries.set(
@@ -144,8 +198,19 @@ export async function checkoutTree(
             )
         );
     }
-    await pruneEmptyDirs(repo, emptied);
     return changes;
+}
+
+/** Every file below a working-tree folder, as repository paths. */
+async function listAll(repo: Repository, dir: string): Promise<string[]> {
+    const out: string[] = [];
+    const walk = async (d: string) => {
+        const { files, folders } = await repo.fs.list(repo.vaultPath(d));
+        for (const f of files) out.push(`${d}/${f}`);
+        for (const f of folders) await walk(`${d}/${f}`);
+    };
+    await walk(dir);
+    return out;
 }
 
 /** Remove directories left empty by deletions, walking up toward the root. */

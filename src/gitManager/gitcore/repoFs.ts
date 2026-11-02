@@ -66,8 +66,9 @@ export class RepoFs {
         return { type: s.type, size: s.size, mtime: s.mtime, ctime: s.ctime };
     }
 
+    /** A file's bytes; null if it is missing or a folder. */
     async read(path: string): Promise<Uint8Array | null> {
-        if (!(await this.adapter.exists(path))) return null;
+        if ((await this.adapter.stat(path))?.type !== "file") return null;
         return new Uint8Array(await this.adapter.readBinary(path));
     }
 

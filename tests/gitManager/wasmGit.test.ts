@@ -1134,3 +1134,127 @@ describe("WasmGit fetch and push over smart HTTP", { timeout: 60_000 }, () => {
         }
     });
 });
+
+describe("WasmGit phase 3 review regressions", { timeout: 30_000 }, () => {
+    const read = (repo: TestRepo, p: string) =>
+        readFileSync(path.join(repo.repoPath, p), "utf8");
+
+    it("handles a case-only rename on case-insensitive storage", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.git.checkoutLocalBranch("renamed");
+        await repo.raw(["mv", "note.md", "Note.md"]);
+        await repo.git.commit("rename");
+        await repo.raw(["mv", "Note.md", "NOTE.md"]);
+        repo.write("NOTE.md", "edited too\n");
+        await repo.raw(["add", "-A"]);
+        await repo.git.commit("rename and edit");
+        await repo.git.checkout("main");
+        const manager = managerFor(repo);
+
+        await manager.checkout("renamed");
+        expect(await repo.statusPorcelain()).toBe("");
+        expect(read(repo, "NOTE.md")).toBe("edited too\n");
+        await manager.checkout("main");
+        expect(await repo.statusPorcelain()).toBe("");
+        expect(read(repo, "note.md")).toBe("base\n");
+    });
+
+    it("refuses to switch branches during a merge", async () => {
+        const repo = withCleanup(await createRepoWithMergeConflict());
+        const manager = managerFor(repo);
+        await expect(manager.checkout("other")).rejects.toThrow(
+            /resolve your current index/
+        );
+        expect(await repo.raw(["branch", "--show-current"])).toBe("main");
+    });
+
+    it("switches between a folder and a file of the same name", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.writeAndCommit("a/b.md", "in folder\n", "folder a");
+        await repo.writeAndCommit("0.md", "zero\n", "zero");
+        await repo.git.checkoutLocalBranch("file-a");
+        await repo.raw(["rm", "-q", "-r", "a"]);
+        repo.write("a", "a is a file\n");
+        repo.write("0.md", "zero changed\n");
+        await repo.raw(["add", "-A"]);
+        await repo.git.commit("a becomes a file");
+        await repo.git.checkout("main");
+        const manager = managerFor(repo);
+
+        await manager.checkout("file-a");
+        expect(read(repo, "a")).toBe("a is a file\n");
+        expect(await repo.statusPorcelain()).toBe("");
+        await manager.checkout("main");
+        expect(read(repo, "a/b.md")).toBe("in folder\n");
+        expect(await repo.statusPorcelain()).toBe("");
+    });
+
+    it("refuses up front when untracked files are in the way of folders or files", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.git.checkoutLocalBranch("adds");
+        await repo.writeAndCommit("p/q.md", "q\n", "p/q");
+        await repo.writeAndCommit("r", "r is a file\n", "r");
+        repo.write("0-first.md", "sorts first\n");
+        await repo.raw(["add", "0-first.md"]);
+        await repo.git.commit("first");
+        await repo.git.checkout("main");
+        const manager = managerFor(repo);
+
+        repo.write("p", "untracked file where a folder goes\n");
+        await expect(manager.checkout("adds")).rejects.toThrow(/p\/q\.md/);
+        expect(await repo.raw(["branch", "--show-current"])).toBe("main");
+        execFileSync("rm", [path.join(repo.repoPath, "p")]);
+
+        repo.write("r/mine.md", "untracked note inside a folder\n");
+        await expect(manager.checkout("adds")).rejects.toThrow(/\br\b/);
+        expect(read(repo, "r/mine.md")).toBe(
+            "untracked note inside a folder\n"
+        );
+        expect(await repo.git.raw(["ls-files", "0-first.md"])).toBe("");
+    });
+
+    it("leaves no branch behind when checking out a remote branch fails", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.raw(["checkout", "-q", "-b", "feature/x"]);
+        await repo.writeAndCommit("x.md", "x\n", "x");
+        await repo.raw(["push", "-q", "origin", "feature/x"]);
+        await repo.raw(["checkout", "-q", "main"]);
+        await repo.raw(["branch", "-q", "-D", "feature/x"]);
+        await repo.raw(["branch", "feature"]);
+        await repo.raw(["fetch", "-q", "origin"]);
+        const manager = managerFor(repo);
+
+        await expect(manager.checkout("feature/x", "origin")).rejects.toThrow(
+            /feature/
+        );
+        expect(await repo.raw(["branch", "--show-current"])).toBe("main");
+        expect(await repo.raw(["branch", "--format=%(refname:short)"])).toBe(
+            "feature\nmain"
+        );
+    });
+
+    it("validates branch names like git check-ref-format", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.raw(["branch", "topic"]);
+        await repo.raw(["pack-refs", "--all"]);
+        const manager = managerFor(repo);
+        await expect(manager.createBranch("a.lock/b")).rejects.toThrow();
+        await expect(manager.createBranch("topic/x")).rejects.toThrow(/topic/);
+        expect(await repo.raw(["branch", "--format=%(refname:short)"])).toBe(
+            "main\ntopic"
+        );
+    });
+
+    it("deletes a branch that is merged into its upstream", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.raw(["checkout", "-q", "-b", "pushed"]);
+        await repo.writeAndCommit("p.md", "p\n", "pushed work");
+        await repo.raw(["push", "-q", "-u", "origin", "pushed"]);
+        await repo.raw(["checkout", "-q", "main"]);
+        const manager = managerFor(repo);
+        await manager.deleteBranch("pushed", false);
+        expect(await repo.raw(["branch", "--format=%(refname:short)"])).toBe(
+            "main"
+        );
+    });
+});
