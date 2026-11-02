@@ -29,8 +29,12 @@ export class Refs {
 
     /** Raw value of a full ref: an oid or "ref: <target>"; null if missing. */
     async readRaw(ref: string): Promise<string | null> {
-        const loose = await this.fs.readText(`${this.gitdir}/${ref}`);
-        if (loose !== null) return loose.trim();
+        const path = `${this.gitdir}/${ref}`;
+        // A ref name can also be a directory of refs (refs/remotes/origin).
+        if ((await this.fs.stat(path))?.type === "file") {
+            const loose = await this.fs.readText(path);
+            if (loose !== null) return loose.trim();
+        }
         return (await this.packed()).refs.get(ref) ?? null;
     }
 

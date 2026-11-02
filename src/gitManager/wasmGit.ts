@@ -49,7 +49,9 @@ function isoDate(p: Person): string {
     return (
         `${local.getUTCFullYear()}-${pad(local.getUTCMonth() + 1)}-${pad(local.getUTCDate())}` +
         `T${pad(local.getUTCHours())}:${pad(local.getUTCMinutes())}:${pad(local.getUTCSeconds())}` +
-        `${p.timezone.slice(0, 3)}:${p.timezone.slice(3, 5)}`
+        (offsetMin === 0
+            ? "Z"
+            : `${p.timezone.slice(0, 3)}:${p.timezone.slice(3, 5)}`)
     );
 }
 
@@ -539,8 +541,8 @@ export class WasmGit extends GitManager {
 
     async stage(filepath: string, relativeToVault: boolean): Promise<void> {
         const gitPath = this.getRelativeRepoPath(filepath, relativeToVault);
-        await this.withIndex(true, (repo, index) =>
-            stagePaths(repo, index, [gitPath], repo.ignoreRules())
+        await this.withIndex(true, async (repo, index) =>
+            stagePaths(repo, index, [gitPath], await repo.ignoreRules())
         );
     }
 
@@ -564,8 +566,8 @@ export class WasmGit extends GitManager {
             : () => true;
         const selected = files.filter((path) => isSelected(path));
         if (selected.length === 0) return;
-        await this.withIndex(true, (repo, index) =>
-            stagePaths(repo, index, selected, repo.ignoreRules())
+        await this.withIndex(true, async (repo, index) =>
+            stagePaths(repo, index, selected, await repo.ignoreRules())
         );
     }
 
@@ -577,7 +579,7 @@ export class WasmGit extends GitManager {
                 repo,
                 index,
                 mtime,
-                repo.ignoreRules(),
+                await repo.ignoreRules(),
                 base
             );
         });

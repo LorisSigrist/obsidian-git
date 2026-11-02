@@ -319,13 +319,20 @@ export class Repository {
         );
     }
 
-    ignoreRules(): IgnoreRules {
-        return new IgnoreRules(this.fs, this.root, this.gitdir);
+    async ignoreRules(): Promise<IgnoreRules> {
+        const ignoreCase = (await this.readConfig()).get("core.ignorecase");
+        return new IgnoreRules(
+            this.fs,
+            this.root,
+            this.gitdir,
+            ignoreCase === "true"
+        );
     }
 
     /**
-     * Files in the working tree, skipping the git directory, nested `.git`
-     * folders, and ignored directories that contain no tracked files.
+     * Files in the working tree, skipping the git directory, ignored
+     * directories that contain no tracked files, submodules (gitlinks) and
+     * other nested repositories.
      */
     async workdirFiles(
         index: GitIndex,
@@ -335,11 +342,21 @@ export class Repository {
         const tracked = [...index.entries.keys(), ...index.conflicts.keys()];
         const hasTrackedUnder = (dir: string) =>
             tracked.some((p) => p.startsWith(dir + "/"));
+        const gitlinks = new Set(
+            [...index.entries.values()]
+                .filter((e) => e.mode === 0o160000)
+                .map((e) => e.path)
+        );
         const files: string[] = [];
         const walk = async (dir: string) => {
+            if (gitlinks.has(dir)) return;
             const { files: names, folders } = await this.fs.list(
                 this.vaultPath(dir)
             );
+            // A nested repository (its own .git file or folder) is not ours to walk.
+            if (dir && (names.includes(".git") || folders.includes(".git"))) {
+                return;
+            }
             for (const name of names) {
                 const path = dir ? `${dir}/${name}` : name;
                 if (inFilters(path, filters)) files.push(path);
@@ -401,7 +418,7 @@ export class Repository {
         }
         const head = await this.flatten(headTree, filters);
         const { index, mtime } = await this.readIndex();
-        const ignore = this.ignoreRules();
+        const ignore = await this.ignoreRules();
         const workdir = new Set(
             await this.workdirFiles(index, ignore, filters)
         );
@@ -444,8 +461,9 @@ export class Repository {
 
     /**
      * Commits reachable from `ref`, newest committer date first (like
-     * `git log`). With `file`, only commits that changed it relative to their
-     * first parent.
+     * `git log`). With `file`, git's default history simplification applies:
+     * a commit is shown only if the file differs from every parent, and when it
+     * matches a parent only that parent's history is followed.
      */
     async log(
         ref = "HEAD",
@@ -462,7 +480,7 @@ export class Repository {
             queue.length > 0 &&
             (limit === undefined || out.length < limit)
         ) {
-            // Pop the newest commit.
+            // Pop the newest commit; ties go to the one queued first.
             let best = 0;
             for (let i = 1; i < queue.length; i++) {
                 if (
@@ -472,13 +490,39 @@ export class Repository {
                     best = i;
             }
             const item = queue.splice(best, 1)[0]!;
-            if (!file || (await this.changesFile(item.commit, file)))
+            // In a shallow clone, parents beyond the boundary are absent.
+            const parents: string[] = [];
+            for (const p of item.commit.parents) {
+                if (await this.objects.has(p)) parents.push(p);
+            }
+            let follow = parents;
+            if (file) {
+                const mine = (await this.treeEntryAt(item.commit.tree, file))
+                    ?.oid;
+                let sameAs: string | undefined;
+                for (const p of parents) {
+                    const theirs = (
+                        await this.treeEntryAt(
+                            (await this.objects.readCommit(p)).tree,
+                            file
+                        )
+                    )?.oid;
+                    if (theirs === mine) {
+                        sameAs = p;
+                        break;
+                    }
+                }
+                if (sameAs) {
+                    follow = [sameAs];
+                } else if (parents.length > 0 || mine !== undefined) {
+                    out.push(item);
+                }
+            } else {
                 out.push(item);
-            for (const parent of item.commit.parents) {
+            }
+            for (const parent of follow) {
                 if (seen.has(parent)) continue;
                 seen.add(parent);
-                // In a shallow clone, parents beyond the boundary are absent.
-                if (!(await this.objects.has(parent))) continue;
                 queue.push({
                     oid: parent,
                     commit: await this.objects.readCommit(parent),
@@ -486,17 +530,5 @@ export class Repository {
             }
         }
         return out;
-    }
-
-    private async changesFile(commit: Commit, file: string): Promise<boolean> {
-        const mine = await this.treeEntryAt(commit.tree, file);
-        const parent = commit.parents[0];
-        if (!parent || !(await this.objects.has(parent)))
-            return mine !== undefined;
-        const theirs = await this.treeEntryAt(
-            (await this.objects.readCommit(parent)).tree,
-            file
-        );
-        return mine?.oid !== theirs?.oid;
     }
 }

@@ -15,7 +15,9 @@ export class IgnoreRules {
         private readonly fs: RepoFs,
         /** Vault path of the repository root ("" for the vault root). */
         private readonly root: string,
-        private readonly gitdir: string
+        private readonly gitdir: string,
+        /** core.ignorecase: whether patterns match regardless of case. */
+        private readonly ignoreCase = false
     ) {}
 
     private vaultPath(rel: string): string {
@@ -26,7 +28,10 @@ export class IgnoreRules {
     private load(path: string): Promise<Ignore | null> {
         return this.fs.readText(path).then((text) => {
             if (text === null) return null;
-            return ignore({ allowRelativePaths: true }).add(text);
+            return ignore({
+                allowRelativePaths: true,
+                ignorecase: this.ignoreCase,
+            }).add(text);
         });
     }
 

@@ -90,8 +90,13 @@ export class GitIndex {
         if (decoder.decode(data.subarray(0, 4)) !== "DIRC") {
             throw new Error("Not a git index file");
         }
-        const sum = sha1_hex(data.subarray(0, data.length - 20));
-        if (sum !== toHex(data.subarray(data.length - 20))) {
+        // With index.skipHash (part of feature.manyFiles) git writes zeros.
+        const trailer = toHex(data.subarray(data.length - 20));
+        const sum =
+            trailer === "0".repeat(40)
+                ? trailer
+                : sha1_hex(data.subarray(0, data.length - 20));
+        if (sum !== trailer) {
             throw new Error("Git index checksum mismatch");
         }
         const version = view.getUint32(4);

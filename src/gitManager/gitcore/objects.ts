@@ -40,6 +40,7 @@ const CACHE_MAX_OBJECT = 256 << 10;
  */
 export class ObjectDb {
     private packs: Pack[] | undefined;
+    private stale = false;
     private readonly cache = new Map<string, GitObject>();
     private cacheBytes = 0;
 
@@ -58,17 +59,29 @@ export class ObjectDb {
 
     /** Forget the pack list, e.g. after a fetch added a pack. */
     invalidatePacks(): void {
-        for (const p of this.packs ?? []) p.reader.free();
-        this.packs = undefined;
+        this.stale = true;
     }
 
+    /**
+     * The current packs. A refresh keeps the readers of packs that still
+     * exist (other reads may be using them) and frees removed ones only once
+     * their pending reads have finished.
+     */
     private async loadPacks(): Promise<Pack[]> {
-        if (this.packs) return this.packs;
+        if (this.packs && !this.stale) return this.packs;
+        this.stale = false;
+        const previous = new Map((this.packs ?? []).map((p) => [p.name, p]));
         const { files } = await this.fs.list(this.packDir);
         const packs: Pack[] = [];
         for (const f of files) {
             if (!f.endsWith(".idx")) continue;
             const name = f.slice(0, -4);
+            const kept = previous.get(name);
+            if (kept) {
+                packs.push(kept);
+                previous.delete(name);
+                continue;
+            }
             const path = `${this.packDir}/${name}.pack`;
             const stat = await this.fs.stat(path);
             const idx = await this.fs.read(`${this.packDir}/${f}`);
@@ -81,6 +94,9 @@ export class ObjectDb {
                 verified: false,
                 lock: Promise.resolve(),
             });
+        }
+        for (const gone of previous.values()) {
+            void gone.lock.then(() => gone.reader.free());
         }
         this.packs = packs;
         return packs;
@@ -162,7 +178,11 @@ export class ObjectDb {
             if (!pack) throw new NotFoundError(`object ${oid}`);
             obj = await this.readPacked(pack, oid);
         }
-        if (obj.type !== "blob" && obj.data.length <= CACHE_MAX_OBJECT) {
+        if (
+            obj.type !== "blob" &&
+            obj.data.length <= CACHE_MAX_OBJECT &&
+            !this.cache.has(oid)
+        ) {
             this.cache.set(oid, obj);
             this.cacheBytes += obj.data.length;
             while (this.cacheBytes > CACHE_LIMIT) {

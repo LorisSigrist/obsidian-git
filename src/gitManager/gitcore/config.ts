@@ -46,6 +46,15 @@ function parseValue(raw: string): string {
     return out;
 }
 
+/** Whether a physical line continues on the next one (unescaped trailing backslash, not a comment). */
+function continues(raw: string): boolean {
+    const t = raw.trimStart();
+    if (t.startsWith("#") || t.startsWith(";") || t.startsWith("["))
+        return false;
+    const backslashes = /\\*$/.exec(raw)![0].length;
+    return backslashes % 2 === 1;
+}
+
 function formatValue(value: string): string {
     const escaped = value
         .replace(/\\/g, "\\\\")
@@ -85,7 +94,7 @@ export class GitConfig {
             let raw = physical[i]!;
             // Continuation lines end with a backslash; keep it in `raw` so
             // untouched lines are written back verbatim.
-            while (raw.endsWith("\\") && i + 1 < physical.length) {
+            while (continues(raw) && i + 1 < physical.length) {
                 raw = raw + "\n" + physical[++i];
             }
             const trimmed = raw.trim();

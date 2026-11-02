@@ -39,7 +39,8 @@ export class RepoFs {
     private readonly adapter: DataAdapter;
     private readonly knownDirs = new Set<string>();
     private readonly blocks = new Map<string, Uint8Array>();
-    private wholeFile: { path: string; data: Uint8Array } | undefined;
+    /** Whole files read where ranged reads are unsupported (most recent last). */
+    private wholeFiles: { path: string; data: Uint8Array }[] = [];
     private rangeSupport: "unknown" | "yes" | "no" = "unknown";
 
     constructor(
@@ -177,7 +178,7 @@ export class RepoFs {
         for (const key of [...this.blocks.keys()]) {
             if (key.startsWith(path + "#")) this.blocks.delete(key);
         }
-        if (this.wholeFile?.path === path) this.wholeFile = undefined;
+        this.wholeFiles = this.wholeFiles.filter((w) => w.path !== path);
     }
 
     private async fetchRange(
@@ -228,14 +229,13 @@ export class RepoFs {
     }
 
     private async whole(path: string): Promise<Uint8Array> {
-        if (this.wholeFile?.path !== path) {
-            this.wholeFile = undefined;
-            this.wholeFile = {
-                path,
-                data: new Uint8Array(await this.adapter.readBinary(path)),
-            };
-        }
-        return this.wholeFile.data;
+        // Two slots, so reads alternating between two packs do not reload them.
+        const hit = this.wholeFiles.find((w) => w.path === path);
+        if (hit) return hit.data;
+        if (this.wholeFiles.length >= 2) this.wholeFiles.shift();
+        const data = new Uint8Array(await this.adapter.readBinary(path));
+        this.wholeFiles.push({ path, data });
+        return data;
     }
 
     /**

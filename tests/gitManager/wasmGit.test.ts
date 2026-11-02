@@ -1,3 +1,4 @@
+import { execFileSync } from "child_process";
 import { randomBytes } from "crypto";
 import { chmodSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
@@ -490,5 +491,124 @@ describe("WasmGit staging and committing", { timeout: 30_000 }, () => {
         ).toBe("");
         expect(readFileSync(configPath, "utf8")).toContain("# a comment");
         expect(await manager.getConfig("user.name")).toBe("  padded ; name  ");
+    });
+});
+
+describe("WasmGit phase 1 review regressions", { timeout: 30_000 }, () => {
+    it("reads an index written with index.skipHash", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.raw(["config", "feature.manyFiles", "true"]);
+        repo.write("a.md", "a\n");
+        await repo.raw(["add", "a.md"]);
+        const manager = managerFor(repo);
+        expect(await ourStatus(manager)).toEqual(await nativeStatus(repo));
+    });
+
+    it("keeps in-flight pack reads working when the pack list refreshes", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        writeFileSync(
+            path.join(repo.repoPath, "big.bin"),
+            randomBytes(5_000_000)
+        );
+        await repo.raw(["add", "big.bin"]);
+        await repo.git.commit("big");
+        await repo.raw(["gc", "--quiet"]);
+        const manager = managerFor(repo);
+        const r = await repoOf(manager);
+        const read = r.readBlobAt("HEAD", "big.bin");
+        const missing = r.objects.has("0".repeat(40));
+        await expect(missing).resolves.toBe(false);
+        expect((await read)!.length).toBe(5_000_000);
+    });
+
+    it("does not report files inside submodules or nested repositories", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        // simple-git refuses protocol overrides, so call git directly.
+        execFileSync(
+            "git",
+            [
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                repo.remotePath,
+                "sub",
+            ],
+            { cwd: repo.repoPath }
+        );
+        await repo.git.commit("add submodule");
+        await repo.raw(["init", "--quiet", "nested"]);
+        repo.write("nested/x.md", "x\n");
+        const manager = managerFor(repo);
+        const ours = await ourStatus(manager);
+        expect([...ours.keys()].filter((p) => p.startsWith("sub/"))).toEqual(
+            []
+        );
+        expect([...ours.keys()].filter((p) => p.startsWith("nested/"))).toEqual(
+            []
+        );
+    });
+
+    it("simplifies file history through merges like git log -- <file>", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.git.checkoutLocalBranch("side");
+        await repo.writeAndCommit("f.md", "side\n", "side change");
+        await repo.git.checkout("main");
+        await repo.writeAndCommit("other.md", "o\n", "unrelated");
+        await repo.raw(["merge", "--no-ff", "-m", "merge", "side"]);
+        const manager = managerFor(repo);
+        expect((await manager.log("f.md", false)).map((e) => e.hash)).toEqual(
+            (await repo.raw(["log", "--format=%H", "--", "f.md"])).split("\n")
+        );
+    });
+
+    it("resolves a remote name through refs/remotes/<remote>/HEAD", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.raw(["remote", "set-head", "origin", "main"]);
+        const manager = managerFor(repo);
+        expect(await manager.resolveRef("origin")).toBe(
+            await repo.raw(["rev-parse", "origin"])
+        );
+    });
+
+    it("does not continue comment lines in config", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const configPath = path.join(repo.repoPath, ".git", "config");
+        const text = readFileSync(configPath, "utf8").replace(
+            '[remote "origin"]',
+            '# trailing \\\n[remote "origin"]'
+        );
+        writeFileSync(configPath, text);
+        const manager = managerFor(repo);
+        expect(await manager.getRemotes()).toEqual(["origin"]);
+        expect(await manager.getRemoteUrl("origin")).toBe(repo.remotePath);
+    });
+
+    it("matches ignore patterns case-sensitively unless core.ignorecase is set", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.raw(["config", "core.ignorecase", "false"]);
+        await repo.writeAndCommit(".gitignore", "*.MD\n", "ignore");
+        repo.write("x.md", "x\n");
+        const manager = managerFor(repo);
+        expect(await ourStatus(manager)).toEqual(await nativeStatus(repo));
+        await repo.raw(["config", "core.ignorecase", "true"]);
+        expect((await ourStatus(manager)).has("x.md")).toBe(false);
+    });
+
+    it("prints UTC commit dates like git", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.raw([
+            "commit",
+            "--allow-empty",
+            "-m",
+            "utc",
+            "--date",
+            "2020-01-01T00:00:00+0000",
+        ]);
+        const manager = managerFor(repo);
+        expect((await manager.log(undefined, true, 1))[0]!.date).toBe(
+            await repo.raw(["log", "-1", "--format=%aI"])
+        );
     });
 });
