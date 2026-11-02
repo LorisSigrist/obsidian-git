@@ -6,6 +6,7 @@
     "scripts": {
         "dev": "node esbuild.config.mjs dev",
         "build": "node esbuild.config.mjs production",
+        "build:wasm": "cd wasm/gitcore && wasm-pack build --release --target web --out-dir pkg --out-name gitcore && rm -f pkg/.gitignore pkg/package.json pkg/README.md",
         "release": "commit-and-tag-version",
         "lint": "eslint src tests vitest.config.ts",
         "format": "prettier --check src tests vitest.config.ts",
@@ -73,6 +74,7 @@
         "diff": "^9.0.0",
         "diff2html": "^3.4.56",
         "diff3": "^0.0.4",
+        "ignore": "^7.0.14",
         "isomorphic-git": "^1.44.3",
         "js-sha256": "^1.0.0",
         "picomatch": "^4.0.7",

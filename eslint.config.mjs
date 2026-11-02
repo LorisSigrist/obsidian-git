@@ -12,6 +12,7 @@ export default defineConfig(
             "**/main.js",
             "eslint.config.mjs",
             "esbuild.config.mjs",
+            "wasm/",
         ],
     },
     eslint.configs.recommended,

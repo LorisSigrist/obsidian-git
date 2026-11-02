@@ -65,6 +65,10 @@ const context = await esbuild.context({
         }),
     ],
     inject: ["polyfill_buffer.js"],
+    // The git core is WASM, inlined into main.js as bytes.
+    loader: { ".wasm": "binary" },
+    // wasm-bindgen's glue only uses import.meta.url for its default loader, which we never call.
+    logOverride: { "empty-import-meta": "silent" },
     outfile: "main.js",
 });
 

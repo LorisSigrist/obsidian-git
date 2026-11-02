@@ -4,6 +4,7 @@ import type { FakePlugin } from "./createFakePlugin";
 import { createRepoWithOrigin, type TestRepo } from "./gitRepo";
 import { createIsomorphicGitManager } from "./isomorphicGit";
 import { createSimpleGitTestContext, type GitFixture } from "./simpleGit";
+import { createWasmGitManager } from "./wasmGit";
 
 export interface GitManagerTestHarness {
     manager: GitManager;
@@ -58,6 +59,25 @@ async function createIsomorphicGitHarness(
     };
 }
 
+async function createWasmGitHarness(
+    fixture?: GitFixture
+): Promise<GitManagerTestHarness> {
+    const repo = await (fixture ?? createRepoWithOrigin)();
+    const { manager, plugin } = createWasmGitManager(
+        repo.repoPath,
+        getVaultOptions(repo)
+    );
+    return {
+        manager,
+        repo,
+        plugin,
+        cleanup: () => {
+            manager.unload();
+            repo.cleanup();
+        },
+    };
+}
+
 export const gitManagerBackends: GitManagerBackend[] = [
     {
         name: "simple-git",
@@ -66,5 +86,9 @@ export const gitManagerBackends: GitManagerBackend[] = [
     {
         name: "isomorphic-git",
         create: createIsomorphicGitHarness,
+    },
+    {
+        name: "wasm-git",
+        create: createWasmGitHarness,
     },
 ];

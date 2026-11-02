@@ -1,4 +1,13 @@
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "fs/promises";
+import {
+    appendFile,
+    mkdir,
+    readFile,
+    readdir,
+    rename,
+    rm,
+    stat,
+    writeFile,
+} from "fs/promises";
 import path from "path";
 import { vi } from "vitest";
 import { IsomorphicGit } from "../../src/gitManager/isomorphicGit";
@@ -11,7 +20,7 @@ export type IsomorphicGitTestContext = {
     updateCachedStatus: ReturnType<typeof vi.fn>;
 };
 
-function createNodeVault(root: string) {
+export function createNodeVault(root: string) {
     const resolve = (vaultPath: string): string =>
         path.join(root, vaultPath.replace(/^\/+/, ""));
     const relative = (vaultPath: string, name: string): string =>
@@ -74,12 +83,19 @@ function createNodeVault(root: string) {
             rm(resolve(vaultPath), { recursive, force: true }),
         remove: (vaultPath: string) =>
             rm(resolve(vaultPath), { recursive: true, force: true }),
+        appendBinary: (vaultPath: string, data: ArrayBuffer) =>
+            appendFile(resolve(vaultPath), new Uint8Array(data)),
+        rename: async (from: string, to: string) => {
+            await mkdir(path.dirname(resolve(to)), { recursive: true });
+            await rename(resolve(from), resolve(to));
+        },
     };
 
     return {
         adapter,
         create: adapter.write,
         createBinary: adapter.writeBinary,
+        createFolder: adapter.mkdir,
         getAbstractFileByPath: () => null,
         getFolderByPath: () => null,
     };

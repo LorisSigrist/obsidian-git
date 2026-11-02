@@ -16,3 +16,6 @@ yarn.lock
 .vscode
 
 .DS_Store
+
+# wasm build output
+/wasm/gitcore/target

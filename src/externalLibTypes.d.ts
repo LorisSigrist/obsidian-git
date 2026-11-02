@@ -11,3 +11,8 @@ declare module "css-color-converter" {
     }
     function fromString(str: string): Color | null;
 }
+
+declare module "*.wasm" {
+    const bytes: Uint8Array;
+    export default bytes;
+}
