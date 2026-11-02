@@ -19,17 +19,26 @@ import {
 } from "../autoCommitGlobs";
 import { GitConflictError, GitOperation } from "../types";
 import { GitManager } from "./gitManager";
-import { NotFoundError, UnmergedPathsError } from "./gitcore/errors";
-import type { GitIndex } from "./gitcore/gitIndex";
+import {
+    MergeConflictError,
+    NotFoundError,
+    UnmergedPathsError,
+} from "./gitcore/errors";
+import type { GitIndex, IndexEntry } from "./gitcore/gitIndex";
 import type { Person } from "./gitcore/model";
 import type { RangeReader } from "./gitcore/repoFs";
-import { Repository, type StatusRow } from "./gitcore/repository";
-import { checkoutTree } from "./gitcore/checkout";
+import {
+    Repository,
+    type FlatEntry,
+    type StatusRow,
+} from "./gitcore/repository";
+import { CheckoutConflictError, checkoutTree } from "./gitcore/checkout";
+import { mergeTrees, writeFlatTree, type Conflict } from "./gitcore/merge";
 import { fetchRemote, pushRef } from "./gitcore/remote";
 import type { AuthCallbacks, HttpClient } from "./gitcore/transport";
 import { GeneralModal } from "../ui/modals/generalModal";
 import { splitRemoteBranch } from "../utils";
-import { isAncestor } from "./gitcore/history";
+import { isAncestor, mergeBases } from "./gitcore/history";
 import {
     cleanMessage,
     person,
@@ -133,6 +142,7 @@ export class WasmGit extends GitManager {
     private static readonly MERGE_HEAD = "MERGE_HEAD";
     private static readonly MERGE_MESSAGE = "MERGE_MSG";
     private static readonly MERGE_MODE = "MERGE_MODE";
+    private static readonly ORIGINAL_HEAD = "ORIG_HEAD";
     // Mapping from status matrix rows to git status codes based off git status --short
     private readonly statusMapping: Readonly<Record<string, string>> = {
         "000": "  ",
@@ -1192,15 +1202,254 @@ export class WasmGit extends GitManager {
         return new Notice(message, this.noticeLength);
     }
 
+    // ---- Merging ----
+
+    async pull(): Promise<PullResult> {
+        return this.withGitOperation(GitOperation.pull, async () => {
+            if (await this.isMergeInProgress()) {
+                throw new Error(
+                    "Cannot pull because a merge is still in progress. Commit or abort it first."
+                );
+            }
+            const branchInfo = await this.branchInfo();
+            if (!branchInfo.current) {
+                throw new Error("No current branch found. Cannot pull.");
+            }
+            const localCommit = await this.resolveRef(branchInfo.current);
+            if (!branchInfo.tracking) {
+                this.plugin.log("No tracking branch found. Ignoring pull.");
+                return { status: "skipped", reason: "no-upstream" };
+            }
+
+            await this.fetch();
+
+            const theirs = await this.resolveRef(branchInfo.tracking);
+            if (localCommit === theirs) return { status: "up-to-date" };
+            const { name, email } = await this.checkAuthorInfo();
+            const repo = await this.repo();
+            if (await isAncestor(repo, theirs, localCommit)) {
+                return { status: "up-to-date" };
+            }
+            const message = `Merge branch '${branchInfo.tracking}' into ${branchInfo.current}`;
+            const localTree = await repo.commitTree(localCommit);
+
+            let result: string;
+            if (await isAncestor(repo, localCommit, theirs)) {
+                result = theirs;
+            } else {
+                const base = (await mergeBases(repo, localCommit, theirs))[0];
+                const merge = await mergeTrees(
+                    repo,
+                    base ? await repo.commitTree(base) : undefined,
+                    localTree,
+                    await repo.commitTree(theirs),
+                    {
+                        strategy: this.plugin.settings.mergeStrategy,
+                        labels: { ours: "HEAD", theirs: branchInfo.tracking },
+                    }
+                );
+                if (merge.conflicts.length > 0) {
+                    // Writing conflicts touches the whole tree, so only do it
+                    // when no local work could be lost.
+                    await this.ensureCleanPullWorktree(localCommit, true);
+                    await this.ensureNoIncomingFileCollisions(
+                        await this.getFileChangesCount(localCommit, theirs)
+                    );
+                    await this.materializeConflicts(
+                        localTree,
+                        merge.merged,
+                        merge.conflicts
+                    );
+                    await this.writeMergeState({
+                        ours: localCommit,
+                        theirs,
+                        message,
+                    });
+                    const files = merge.conflicts.map((c) => c.path);
+                    throw new GitConflictError(
+                        files,
+                        new MergeConflictError(files)
+                    );
+                }
+                const me = person(name, email);
+                result = await writeCommit(repo, {
+                    tree: await writeFlatTree(repo, merge.merged),
+                    parents: [localCommit, theirs],
+                    message: `${message}\n`,
+                    author: me,
+                    committer: me,
+                });
+            }
+
+            const resultTree = await repo.commitTree(result);
+            const changedFiles = await repo.diffTrees(localTree, resultTree);
+            if (changedFiles.length > 0) {
+                const filepaths = changedFiles.map((file) => file.path);
+                await this.ensureNoIncomingFileCollisions(changedFiles);
+                await this.ensureCleanPullWorktree(
+                    localCommit,
+                    true,
+                    filepaths
+                );
+                await this.withIndex(true, async (r, index, mtime) => {
+                    try {
+                        await checkoutTree(
+                            r,
+                            index,
+                            mtime,
+                            await r.ignoreRules(),
+                            localTree,
+                            resultTree,
+                            { filepaths }
+                        );
+                    } catch (e) {
+                        if (e instanceof CheckoutConflictError) {
+                            // eslint-disable-next-line preserve-caught-error -- Error.cause is unavailable with the project's ES2021 target.
+                            throw new Error(
+                                `Cannot pull with uncommitted working tree changes: ${e.filepaths.join(", ")}`
+                            );
+                        }
+                        throw e;
+                    }
+                });
+            }
+            // HEAD moves only once the working tree has the result.
+            await repo.refs.write(`refs/heads/${branchInfo.current}`, result);
+            return {
+                status: "updated",
+                outsideVault: 0,
+                files: changedFiles.map<FileStatusResult>((file) => ({
+                    path: file.path,
+                    workingDir: "P",
+                    index: "P",
+                    vaultPath: this.getRelativeVaultPath(file.path),
+                })),
+            };
+        });
+    }
+
+    private async ensureCleanPullWorktree(
+        ref: string,
+        checkIndex = false,
+        filepaths?: string[]
+    ): Promise<void> {
+        const rows = await (await this.repo()).statusMatrix({ ref, filepaths });
+        const changed = rows
+            .filter(
+                ([, head, workdir, stage]) =>
+                    head !== workdir || (checkIndex && head !== stage)
+            )
+            .map(([filepath]) => filepath);
+        if (changed.length > 0) {
+            throw new Error(
+                `Cannot pull with uncommitted working tree changes: ${changed.join(", ")}`
+            );
+        }
+    }
+
+    private async ensureNoIncomingFileCollisions(
+        files: WalkDifference[]
+    ): Promise<void> {
+        // Ignored untracked files are absent from the status matrix.
+        for (const file of files) {
+            if (
+                file.type === "A" &&
+                (await this.app.vault.adapter.exists(
+                    this.getRelativeVaultPath(file.path)
+                ))
+            ) {
+                throw new Error(
+                    `Cannot pull because an untracked file would be overwritten: ${file.path}`
+                );
+            }
+        }
+    }
+
+    /**
+     * Put a conflicted merge into the working tree and index: clean results
+     * as usual, conflicted files with markers (or the surviving side) and
+     * their base/ours/theirs entries as index stages 1–3.
+     */
+    private async materializeConflicts(
+        localTree: string,
+        merged: Map<string, FlatEntry>,
+        conflicts: Conflict[]
+    ): Promise<void> {
+        await this.withIndex(true, async (repo, index, mtime) => {
+            const tentative = await writeFlatTree(repo, merged);
+            await checkoutTree(
+                repo,
+                index,
+                mtime,
+                await repo.ignoreRules(),
+                localTree,
+                tentative
+            );
+            for (const c of conflicts) {
+                if (c.worktree) {
+                    await repo.fs.write(repo.vaultPath(c.path), c.worktree);
+                }
+                index.entries.delete(c.path);
+                const stages: IndexEntry[] = [];
+                ([c.base, c.ours, c.theirs] as const).forEach((e, i) => {
+                    if (!e) return;
+                    stages.push({
+                        path: c.path,
+                        oid: e.oid,
+                        mode: parseInt(e.mode, 8),
+                        ctimeSec: 0,
+                        ctimeNsec: 0,
+                        mtimeSec: 0,
+                        mtimeNsec: 0,
+                        dev: 0,
+                        ino: 0,
+                        uid: 0,
+                        gid: 0,
+                        size: 0,
+                        stage: i + 1,
+                        assumeValid: false,
+                        skipWorktree: false,
+                        intentToAdd: false,
+                    });
+                });
+                index.conflicts.set(c.path, stages);
+            }
+        });
+        this.plugin.setPluginState({ mergeInProgress: true });
+    }
+
+    private async writeMergeState({
+        ours,
+        theirs,
+        message,
+    }: {
+        ours: string;
+        theirs: string;
+        message: string;
+    }): Promise<void> {
+        const adapter = this.app.vault.adapter;
+        await adapter.write(
+            this.getMergeStatePath(WasmGit.ORIGINAL_HEAD),
+            `${ours}\n`
+        );
+        await adapter.write(
+            this.getMergeStatePath(WasmGit.MERGE_MESSAGE),
+            `${message}\n`
+        );
+        await adapter.write(this.getMergeStatePath(WasmGit.MERGE_MODE), "");
+        // MERGE_HEAD is written last because its presence marks the merge as active.
+        await adapter.write(
+            this.getMergeStatePath(WasmGit.MERGE_HEAD),
+            `${theirs}\n`
+        );
+    }
+
     // ---- Not yet implemented (later phases) ----
 
     private notYet(name: string): never {
         throw new Error(`${name} is not implemented in the WASM backend yet`);
     }
 
-    pull(): Promise<PullResult> {
-        this.notYet("pull");
-    }
     init(): Promise<void> {
         this.notYet("init");
     }
