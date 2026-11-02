@@ -9,6 +9,7 @@ import type {
     PullResult,
     PushResult,
     Status,
+    UnstagedFile,
     WalkDifference,
 } from "../types";
 import {
@@ -16,11 +17,24 @@ import {
     type AutoCommitGlobSelection,
     type AutoCommitSelectedFiles,
 } from "../autoCommitGlobs";
+import { GitConflictError, GitOperation } from "../types";
 import { GitManager } from "./gitManager";
-import { NotFoundError } from "./gitcore/errors";
+import { NotFoundError, UnmergedPathsError } from "./gitcore/errors";
+import type { GitIndex } from "./gitcore/gitIndex";
 import type { Person } from "./gitcore/model";
 import type { RangeReader } from "./gitcore/repoFs";
 import { Repository, type StatusRow } from "./gitcore/repository";
+import {
+    cleanMessage,
+    person,
+    resetPaths,
+    restoreFromIndex,
+    stagePaths,
+    unstagedChanges,
+    updateHead,
+    writeCommit,
+    writeTree,
+} from "./gitcore/worktree";
 
 const decoder = new TextDecoder();
 
@@ -45,6 +59,8 @@ function isoDate(p: Person): string {
  */
 export class WasmGit extends GitManager {
     private static readonly MERGE_HEAD = "MERGE_HEAD";
+    private static readonly MERGE_MESSAGE = "MERGE_MSG";
+    private static readonly MERGE_MODE = "MERGE_MODE";
     // Mapping from status matrix rows to git status codes based off git status --short
     private readonly statusMapping: Readonly<Record<string, string>> = {
         "000": "  ",
@@ -477,42 +493,254 @@ export class WasmGit extends GitManager {
         return Promise.resolve();
     }
 
-    // ---- Not yet implemented (later phases) ----
+    // ---- Staging and committing ----
 
-    private notYet(name: string): never {
-        throw new Error(`${name} is not implemented in the WASM backend yet`);
+    private indexQueue: Promise<unknown> = Promise.resolve();
+
+    /**
+     * Run a read-modify-write of the index. Calls are serialized so concurrent
+     * stage/unstage requests cannot overwrite each other's changes.
+     */
+    private withIndex<T>(
+        write: boolean,
+        fn: (repo: Repository, index: GitIndex, mtime: number) => Promise<T>
+    ): Promise<T> {
+        const run = this.indexQueue.then(async () => {
+            const repo = await this.repo();
+            const { index, mtime } = await repo.readIndex();
+            const result = await fn(repo, index, mtime);
+            if (write) await repo.writeIndex(index);
+            return result;
+        });
+        this.indexQueue = run.catch(() => undefined);
+        return run;
     }
 
-    commitAll(_: {
+    private async checkAuthorInfo(): Promise<{ name: string; email: string }> {
+        const name = await this.getConfig("user.name");
+        const email = await this.getConfig("user.email");
+        if (!name || !email) {
+            throw Error(
+                "Git author name and email are not set. Please set both fields in the settings."
+            );
+        }
+        return { name, email };
+    }
+
+    async setConfig(
+        path: string,
+        value: string | number | boolean | undefined
+    ): Promise<void> {
+        const repo = await this.repo();
+        const config = await repo.readConfig();
+        config.set(path, value === undefined ? undefined : String(value));
+        await repo.writeConfig(config);
+    }
+
+    async stage(filepath: string, relativeToVault: boolean): Promise<void> {
+        const gitPath = this.getRelativeRepoPath(filepath, relativeToVault);
+        await this.withIndex(true, (repo, index) =>
+            stagePaths(repo, index, [gitPath], repo.ignoreRules())
+        );
+    }
+
+    async stageAll({
+        dir,
+        status,
+        unstagedFiles,
+        selection,
+    }: {
+        dir?: string;
+        status?: Status;
+        unstagedFiles?: FileStatusResult[];
+        selection?: AutoCommitGlobSelection;
+    }): Promise<void> {
+        const statusFiles = unstagedFiles ?? status?.changed;
+        const files = statusFiles
+            ? statusFiles.map((file) => file.path)
+            : (await this.getUnstagedFiles(dir ?? ".")).map(({ path }) => path);
+        const isSelected = selection
+            ? createAutoCommitPathSelector(selection)
+            : () => true;
+        const selected = files.filter((path) => isSelected(path));
+        if (selected.length === 0) return;
+        await this.withIndex(true, (repo, index) =>
+            stagePaths(repo, index, selected, repo.ignoreRules())
+        );
+    }
+
+    async getUnstagedFiles(base = "."): Promise<UnstagedFile[]> {
+        return this.withSlowNotice(async () => {
+            const repo = await this.repo();
+            const { index, mtime } = await repo.readIndex();
+            return unstagedChanges(
+                repo,
+                index,
+                mtime,
+                repo.ignoreRules(),
+                base
+            );
+        });
+    }
+
+    async unstage(filepath: string, relativeToVault: boolean): Promise<void> {
+        const gitPath = this.getRelativeRepoPath(filepath, relativeToVault);
+        await this.withIndex(true, (repo, index) =>
+            resetPaths(repo, index, [gitPath])
+        );
+    }
+
+    async unstageAll({
+        dir,
+        status,
+    }: {
+        dir?: string;
+        status?: Status;
+    }): Promise<void> {
+        const staged = status
+            ? status.staged.map((file) => file.path)
+            : (await this.getStagedFiles(dir ?? ".")).map(({ path }) => path);
+        await this.withIndex(true, (repo, index) =>
+            resetPaths(repo, index, staged)
+        );
+    }
+
+    async discard(filepath: string): Promise<void> {
+        await this.withIndex(true, (repo, index) =>
+            restoreFromIndex(repo, index, [filepath])
+        );
+    }
+
+    async discardAll({
+        dir,
+        status,
+    }: {
+        dir?: string;
+        status?: Status;
+    }): Promise<void> {
+        let files: string[];
+        if (status) {
+            files = status.changed
+                .filter(
+                    (file) =>
+                        file.workingDir != "U" &&
+                        (dir == undefined || file.path.startsWith(dir))
+                )
+                .map((file) => file.path);
+        } else {
+            files = (await this.getUnstagedFiles(dir))
+                .filter((file) => file.type != "A")
+                .map(({ path }) => path);
+        }
+        if (files.length === 0) return;
+        await this.withIndex(true, (repo, index) =>
+            restoreFromIndex(repo, index, files)
+        );
+    }
+
+    async commitAll({
+        message,
+        status,
+        unstagedFiles,
+        selection,
+        amend,
+    }: {
         message: string;
         status?: Status;
         unstagedFiles?: FileStatusResult[];
         selection?: AutoCommitGlobSelection;
         amend?: boolean;
     }): Promise<number> {
-        this.notYet("commitAll");
+        await this.checkAuthorInfo();
+        await this.stageAll({ status, unstagedFiles, selection });
+        return this.commit({ message, amend });
     }
-    commit(_: { message: string; amend?: boolean }): Promise<number> {
-        this.notYet("commit");
+
+    async commit({
+        message,
+        amend,
+    }: {
+        message: string;
+        amend?: boolean;
+    }): Promise<number> {
+        return this.withGitOperation(GitOperation.commit, async () => {
+            try {
+                const { name, email } = await this.checkAuthorInfo();
+                const formatMessage = await this.formatCommitMessage(message);
+                const mergeHeads = await this.getMergeHeads();
+                const oid = await this.withIndex(false, async (repo, index) => {
+                    const tree = await writeTree(repo, index);
+                    const head = await repo.headOid();
+                    const committer = person(name, email);
+                    let author = committer;
+                    let parents: string[];
+                    if (amend) {
+                        if (!head)
+                            throw new Error("There is no commit to amend.");
+                        const previous = await repo.objects.readCommit(head);
+                        parents = previous.parents;
+                        author = previous.author;
+                    } else {
+                        parents = head ? [head, ...mergeHeads] : [];
+                    }
+                    const commit = await writeCommit(repo, {
+                        tree,
+                        parents,
+                        message: cleanMessage(formatMessage),
+                        author,
+                        committer,
+                    });
+                    await updateHead(repo, commit);
+                    return commit;
+                });
+                const committedFiles = await this.getCommittedFilesCount(oid);
+                await this.clearMergeState();
+                this.plugin.setPluginState({ mergeInProgress: false });
+                return committedFiles;
+            } catch (error) {
+                if (error instanceof UnmergedPathsError) {
+                    throw new GitConflictError(error.filepaths, error);
+                }
+                throw error;
+            }
+        });
     }
-    stageAll(_: { dir?: string; status?: Status }): Promise<void> {
-        this.notYet("stageAll");
+
+    private async getCommittedFilesCount(oid: string): Promise<number> {
+        const repo = await this.repo();
+        const commit = await repo.objects.readCommit(oid);
+        const parent = commit.parents[0];
+        if (!parent) return (await repo.flatten(commit.tree)).size;
+        return (await this.getFileChangesCount(parent, oid)).length;
     }
-    unstageAll(_: { dir?: string; status?: Status }): Promise<void> {
-        this.notYet("unstageAll");
+
+    private async getMergeHeads(): Promise<string[]> {
+        const path = this.getMergeStatePath(WasmGit.MERGE_HEAD);
+        if (!(await this.app.vault.adapter.exists(path))) return [];
+        return (await this.app.vault.adapter.read(path))
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0);
     }
-    stage(_: string, __: boolean): Promise<void> {
-        this.notYet("stage");
+
+    private async clearMergeState(): Promise<void> {
+        const adapter = this.app.vault.adapter;
+        for (const filename of [
+            WasmGit.MERGE_HEAD,
+            WasmGit.MERGE_MESSAGE,
+            WasmGit.MERGE_MODE,
+        ]) {
+            const path = this.getMergeStatePath(filename);
+            if (await adapter.exists(path)) await adapter.remove(path);
+        }
     }
-    unstage(_: string, __: boolean): Promise<void> {
-        this.notYet("unstage");
+
+    // ---- Not yet implemented (later phases) ----
+
+    private notYet(name: string): never {
+        throw new Error(`${name} is not implemented in the WASM backend yet`);
     }
-    discard(_: string): Promise<void> {
-        this.notYet("discard");
-    }
-    discardAll(_: { dir?: string; status?: Status }): Promise<void> {
-        this.notYet("discardAll");
-    }
+
     pull(): Promise<PullResult> {
         this.notYet("pull");
     }
@@ -533,12 +761,6 @@ export class WasmGit extends GitManager {
     }
     clone(_: string, __: string, ___?: number): Promise<void> {
         this.notYet("clone");
-    }
-    setConfig(
-        _: string,
-        __: string | number | boolean | undefined
-    ): Promise<void> {
-        this.notYet("setConfig");
     }
     fetch(_?: string): Promise<void> {
         this.notYet("fetch");

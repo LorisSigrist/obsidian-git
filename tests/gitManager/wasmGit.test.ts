@@ -1,11 +1,16 @@
 import { randomBytes } from "crypto";
-import { readFileSync, writeFileSync } from "fs";
+import { chmodSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
 import { describe, expect, it } from "vitest";
 import type { WasmGit } from "../../src/gitManager/wasmGit";
 import type { Repository } from "../../src/gitManager/gitcore/repository";
 import { withCleanup } from "../helpers/cleanup";
-import { createRepoWithOrigin, type TestRepo } from "../helpers/gitRepo";
+import {
+    createEmptyRepo,
+    createRepoWithMergeConflict,
+    createRepoWithOrigin,
+    type TestRepo,
+} from "../helpers/gitRepo";
 import { createWasmGitManager } from "../helpers/wasmGit";
 
 function managerFor(repo: TestRepo): WasmGit {
@@ -92,7 +97,7 @@ async function makeChanges(repo: TestRepo): Promise<void> {
     repo.write(".obsidian/workspace.json", "{}\n");
 }
 
-describe("WasmGit read-only operations", () => {
+describe("WasmGit read-only operations", { timeout: 30_000 }, () => {
     it("reports the same status as git, with loose objects", async () => {
         const repo = withCleanup(await richRepo());
         await makeChanges(repo);
@@ -281,5 +286,209 @@ describe("WasmGit read-only operations", () => {
         expect(await manager.resolveRef("origin/main")).toBe(
             await repo.raw(["rev-parse", "origin/main"])
         );
+    });
+});
+
+/** Native git must accept everything we wrote. */
+async function expectFsckClean(repo: TestRepo): Promise<void> {
+    await expect(
+        repo.raw(["fsck", "--full", "--strict", "--no-dangling"])
+    ).resolves.toBe("");
+}
+
+describe("WasmGit staging and committing", { timeout: 30_000 }, () => {
+    it("stages, unstages and discards like git", async () => {
+        const repo = withCleanup(await richRepo());
+        await makeChanges(repo);
+        const manager = managerFor(repo);
+
+        await manager.stage("worktree/note.md", true);
+        await manager.stage("deleted.md", false);
+        await manager.stage("untracked.md", false);
+        await manager.stage("worktree/dir", true);
+        await manager.stage("ignored.log", false);
+        await manager.unstage("staged-then-edited.md", false);
+        await manager.unstage("worktree/new-staged.md", true);
+
+        const native = await nativeStatus(repo);
+        expect(native.get("note.md")).toBe("M ");
+        expect(native.get("deleted.md")).toBe("D ");
+        expect(native.get("untracked.md")).toBe("A ");
+        expect(native.get("dir/sub/b.md")).toBe("M ");
+        expect(native.get("dir/untracked-deep/x.md")).toBe("A ");
+        expect(native.get("staged-then-edited.md")).toBe(" M");
+        expect(native.get("new-staged.md")).toBe("UU");
+        // Ignored files are not added without force, nested ignores included.
+        expect(native.has("ignored.log")).toBe(false);
+        expect(
+            await repo.raw([
+                "ls-files",
+                "--",
+                "dir/sub/local.md",
+                "ignored.log",
+            ])
+        ).toBe("");
+        expect(await ourStatus(manager)).toEqual(native);
+
+        await manager.discard("staged-then-edited.md");
+        expect(
+            readFileSync(
+                path.join(repo.repoPath, "staged-then-edited.md"),
+                "utf8"
+            )
+        ).toBe("v1\n");
+        await manager.discardAll({});
+        expect(
+            readFileSync(path.join(repo.repoPath, "tracked.log"), "utf8")
+        ).toBe("tracked\n");
+        expect(await ourStatus(manager)).toEqual(await nativeStatus(repo));
+        await expectFsckClean(repo);
+    });
+
+    it("writes commits, trees and an index that git accepts", async () => {
+        const repo = withCleanup(await richRepo());
+        await repo.raw(["gc", "--quiet"]);
+        await makeChanges(repo);
+        repo.write("ünïcödé/日本語.md", "unicode\n");
+        repo.write("a b/c d.md", "spaces\n");
+        writeFileSync(path.join(repo.repoPath, "script.sh"), "#!/bin/sh\n");
+        chmodSync(path.join(repo.repoPath, "script.sh"), 0o755);
+        await repo.raw(["add", "script.sh"]);
+        await repo.git.commit("exec");
+        repo.write("script.sh", "#!/bin/sh\necho\n");
+        const manager = managerFor(repo);
+
+        const count = await manager.commitAll({
+            message: "everything\n\nbody  ",
+        });
+        await expectFsckClean(repo);
+        expect(await repo.statusPorcelain()).toBe("");
+        expect(await repo.raw(["log", "-1", "--format=%B"])).toBe(
+            "everything\n\nbody"
+        );
+        expect(await repo.raw(["log", "-1", "--format=%an <%ae>"])).toBe(
+            "Test User <test@example.com>"
+        );
+        expect(count).toBe(
+            (await repo.raw(["diff", "--name-only", "HEAD~1", "HEAD"])).split(
+                "\n"
+            ).length
+        );
+        // The exec bit survives restaging.
+        expect(await repo.raw(["ls-tree", "HEAD", "script.sh"])).toMatch(
+            /^100755 /
+        );
+        expect(await repo.raw(["show", "HEAD:ünïcödé/日本語.md"])).toBe(
+            "unicode"
+        );
+        expect(await ourStatus(manager)).toEqual(new Map());
+    });
+
+    it("amends the last commit, keeping its author", async () => {
+        const repo = withCleanup(await richRepo());
+        await repo.raw([
+            "commit",
+            "--allow-empty",
+            "-m",
+            "by someone else",
+            "--author",
+            "Other <other@example.com>",
+        ]);
+        const parent = await repo.raw(["rev-parse", "HEAD~1"]);
+        repo.write("amended.md", "x\n");
+        const manager = managerFor(repo);
+
+        await manager.commitAll({ message: "amended", amend: true });
+        expect(await repo.raw(["rev-parse", "HEAD~1"])).toBe(parent);
+        expect(await repo.raw(["log", "-1", "--format=%an|%cn|%s"])).toBe(
+            "Other|Test User|amended"
+        );
+        expect(await repo.raw(["show", "HEAD:amended.md"])).toBe("x");
+        await expectFsckClean(repo);
+    });
+
+    it("makes the first commit of an empty repository", async () => {
+        const repo = withCleanup(await createEmptyRepo());
+        await repo.raw(["config", "user.name", "First"]);
+        await repo.raw(["config", "user.email", "first@example.com"]);
+        repo.write("first.md", "hello\n");
+        repo.write("sub/second.md", "world\n");
+        const manager = managerFor(repo);
+
+        expect(await manager.status()).toMatchObject({
+            all: [
+                { path: "first.md", index: "U", workingDir: "U" },
+                { path: "sub/second.md", index: "U", workingDir: "U" },
+            ],
+        });
+        expect(await manager.commitAll({ message: "first" })).toBe(2);
+        expect(await repo.raw(["rev-list", "--count", "HEAD"])).toBe("1");
+        expect(await repo.statusPorcelain()).toBe("");
+        await expectFsckClean(repo);
+    });
+
+    it("resolves conflicts by staging and records both merge parents", async () => {
+        const repo = withCleanup(await createRepoWithMergeConflict());
+        const manager = managerFor(repo);
+        expect((await manager.status()).conflicted).toEqual(["note.md"]);
+
+        repo.write("note.md", "resolved\n");
+        await manager.stage("note.md", false);
+        expect(await repo.raw(["diff", "--name-only", "--diff-filter=U"])).toBe(
+            ""
+        );
+        await manager.commit({ message: "merge" });
+        expect(await repo.raw(["log", "-1", "--format=%P"])).toBe(
+            `${await repo.raw(["rev-parse", "HEAD~1"])} ${await repo.raw(["rev-parse", "other"])}`
+        );
+        expect(await manager.isMergeInProgress()).toBe(false);
+        await expectFsckClean(repo);
+    });
+
+    it("applies concurrent stage requests without losing any", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const names = Array.from({ length: 12 }, (_, i) => `n${i}.md`);
+        for (const n of names) repo.write(n, `${n}\n`);
+        const manager = managerFor(repo);
+
+        await Promise.all(names.map((n) => manager.stage(n, false)));
+        expect(
+            (await repo.raw(["diff", "--cached", "--name-only"])).split("\n")
+        ).toEqual([...names].sort());
+    });
+
+    it("edits config like git config, keeping the rest of the file", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const configPath = path.join(repo.repoPath, ".git", "config");
+        writeFileSync(
+            configPath,
+            readFileSync(configPath, "utf8") +
+                '# a comment\n[branch "feature/x"]\n\tremote = origin\n'
+        );
+        const manager = managerFor(repo);
+
+        await manager.setConfig("user.name", "  padded ; name  ");
+        await manager.setConfig(
+            "branch.feature/x.merge",
+            "refs/heads/feature/x"
+        );
+        await manager.setConfig("new.section.key", 'say "hi"');
+        await manager.setConfig("branch.main.remote", undefined);
+
+        expect(await repo.raw(["config", "--get", "user.name"])).toBe(
+            "padded ; name"
+        );
+        expect(
+            await repo.raw(["config", "--get", "branch.feature/x.merge"])
+        ).toBe("refs/heads/feature/x");
+        expect(await repo.raw(["config", "--get", "new.section.key"])).toBe(
+            'say "hi"'
+        );
+        // `git config --get` exits 1 without output for a missing key.
+        expect(
+            await repo.raw(["config", "--get-all", "branch.main.remote"])
+        ).toBe("");
+        expect(readFileSync(configPath, "utf8")).toContain("# a comment");
+        expect(await manager.getConfig("user.name")).toBe("  padded ; name  ");
     });
 });

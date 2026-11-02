@@ -11,23 +11,39 @@ interface Line {
     isHeader?: boolean;
 }
 
+/**
+ * Decode a config value: quotes group text (whitespace inside them is kept),
+ * backslash escapes, `;`/`#` start a comment outside quotes, and unquoted
+ * leading/trailing whitespace is dropped.
+ */
 function parseValue(raw: string): string {
     let out = "";
     let quoted = false;
+    let started = false;
+    // Unquoted whitespace is held back until we know it is not trailing.
+    let pending = "";
+    const emit = (text: string) => {
+        out += pending + text;
+        pending = "";
+        started = true;
+    };
     for (let i = 0; i < raw.length; i++) {
         const c = raw[i]!;
         if (c === '"') {
             quoted = !quoted;
+            emit("");
         } else if (c === "\\" && i + 1 < raw.length) {
             const n = raw[++i]!;
-            out += n === "n" ? "\n" : n === "t" ? "\t" : n === "b" ? "\b" : n;
+            emit(n === "n" ? "\n" : n === "t" ? "\t" : n === "b" ? "\b" : n);
         } else if ((c === ";" || c === "#") && !quoted) {
             break;
+        } else if (!quoted && /\s/.test(c)) {
+            if (started) pending += c;
         } else {
-            out += c;
+            emit(c);
         }
     }
-    return quoted ? out : out.trim();
+    return out;
 }
 
 function formatValue(value: string): string {
