@@ -602,10 +602,17 @@ export class WasmGit extends GitManager {
             ? createAutoCommitPathSelector(selection)
             : () => true;
         const selected = files.filter((path) => isSelected(path));
-        if (selected.length === 0) return;
-        await this.withIndex(true, async (repo, index) =>
-            stagePaths(repo, index, selected, await repo.ignoreRules())
-        );
+        await this.withIndex(true, async (repo, index) => {
+            // `status.changed` leaves conflicted paths out, but staging
+            // everything (`git add -A`) is what resolves them.
+            for (const path of index.conflicts.keys()) {
+                if (!selected.includes(path) && isSelected(path)) {
+                    selected.push(path);
+                }
+            }
+            if (selected.length === 0) return;
+            await stagePaths(repo, index, selected, await repo.ignoreRules());
+        });
     }
 
     async getUnstagedFiles(base = "."): Promise<UnstagedFile[]> {
@@ -663,7 +670,9 @@ export class WasmGit extends GitManager {
                 .filter(
                     (file) =>
                         file.workingDir != "U" &&
-                        (dir == undefined || file.path.startsWith(dir))
+                        (dir == undefined ||
+                            file.path === dir ||
+                            file.path.startsWith(dir.replace(/\/$/, "") + "/"))
                 )
                 .map((file) => file.path);
         } else {
@@ -714,6 +723,11 @@ export class WasmGit extends GitManager {
                     let author = committer;
                     let parents: string[];
                     if (amend) {
+                        if (mergeHeads.length > 0) {
+                            throw new Error(
+                                "You are in the middle of a merge -- cannot amend."
+                            );
+                        }
                         if (!head)
                             throw new Error("There is no commit to amend.");
                         const previous = await repo.objects.readCommit(head);
@@ -721,6 +735,15 @@ export class WasmGit extends GitManager {
                         author = previous.author;
                     } else {
                         parents = head ? [head, ...mergeHeads] : [];
+                        // Like git (and the native backend), nothing staged
+                        // means no commit.
+                        const unchanged = head
+                            ? (await repo.objects.readCommit(head)).tree ===
+                              tree
+                            : index.entries.size === 0;
+                        if (unchanged && mergeHeads.length === 0) {
+                            return undefined;
+                        }
                     }
                     const commit = await writeCommit(repo, {
                         tree,
@@ -732,6 +755,7 @@ export class WasmGit extends GitManager {
                     await updateHead(repo, commit);
                     return commit;
                 });
+                if (oid === undefined) return 0;
                 const committedFiles = await this.getCommittedFilesCount(oid);
                 await this.clearMergeState();
                 this.plugin.setPluginState({ mergeInProgress: false });

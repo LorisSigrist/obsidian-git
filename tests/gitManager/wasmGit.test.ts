@@ -786,3 +786,110 @@ describe("WasmGit branches and remotes", { timeout: 30_000 }, () => {
         ).toBe("");
     });
 });
+
+describe("WasmGit phase 2 review regressions", { timeout: 30_000 }, () => {
+    it("replaces a file with a folder without writing a corrupt tree", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.writeAndCommit("a", "file\n", "a is a file");
+        repo.remove("a");
+        repo.write("a/b.md", "now a folder\n");
+        const manager = managerFor(repo);
+        await manager.stage("a/b.md", false);
+        await manager.commit({ message: "file to folder" });
+        await expectFsckClean(repo);
+        expect(await repo.raw(["ls-tree", "-r", "--name-only", "HEAD"])).toBe(
+            "a/b.md\nnote.md"
+        );
+    });
+
+    it("stages resolved conflicts when committing all with a status", async () => {
+        const repo = withCleanup(await createRepoWithMergeConflict());
+        repo.write("note.md", "resolved\n");
+        const manager = managerFor(repo);
+        const status = await manager.status();
+        await manager.commitAll({
+            message: "resolve",
+            status,
+            unstagedFiles: status.changed,
+        });
+        expect(await repo.show("HEAD:note.md")).toBe("resolved");
+        expect(await repo.raw(["log", "-1", "--format=%P"])).toContain(" ");
+    });
+
+    it("does not hide an edit made while the file was being staged", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        repo.write("race.md", "v1\n");
+        const { manager, plugin } = createWasmGitManager(repo.repoPath, {
+            vaultPath: repo.dir,
+            basePath: "worktree",
+        });
+        const adapter = (
+            plugin.app as unknown as {
+                vault: {
+                    adapter: { readBinary(p: string): Promise<ArrayBuffer> };
+                };
+            }
+        ).vault.adapter;
+        const original = adapter.readBinary.bind(adapter);
+        let raced = false;
+        adapter.readBinary = async (p: string) => {
+            const data = await original(p);
+            if (!raced && p.endsWith("race.md")) {
+                raced = true;
+                await new Promise((r) => setTimeout(r, 20));
+                repo.write("race.md", "v2 edited mid-stage\n");
+            }
+            return data;
+        };
+        await manager.stage("race.md", false);
+        expect((await ourStatus(manager)).get("race.md")).toBe("AM");
+        expect(await ourStatus(manager)).toEqual(await nativeStatus(repo));
+    });
+
+    it("makes no commit when nothing is staged", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const head = await repo.head();
+        const manager = managerFor(repo);
+        expect(await manager.commit({ message: "nothing" })).toBe(0);
+        expect(await repo.head()).toBe(head);
+    });
+
+    it("refuses to amend in the middle of a merge", async () => {
+        const repo = withCleanup(await createRepoWithMergeConflict());
+        repo.write("note.md", "resolved\n");
+        const manager = managerFor(repo);
+        await manager.stage("note.md", false);
+        await expect(
+            manager.commit({ message: "x", amend: true })
+        ).rejects.toThrow(/middle of a merge/);
+        expect(await manager.isMergeInProgress()).toBe(true);
+    });
+
+    it("cleans commit messages like git commit -m", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const manager = managerFor(repo);
+        repo.write("a.md", "a\n");
+        await manager.commitAll({ message: "\n\nleading  \n\n\n\nbody\n\n" });
+        expect(await repo.git.raw(["cat-file", "commit", "HEAD"])).toMatch(
+            /\n\nleading\n\nbody\n$/
+        );
+        repo.write("b.md", "b\n");
+        await expect(manager.commitAll({ message: "  \n " })).rejects.toThrow(
+            /empty commit message/
+        );
+    });
+
+    it("stages the deletion of a whole folder", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.writeAndCommit("dir/a.md", "a\n", "a");
+        await repo.writeAndCommit("dir/sub/b.md", "b\n", "b");
+        await repo.raw(["rm", "-q", "-r", "--cached", "dir"]);
+        await repo.raw(["reset", "-q"]);
+        execFileSync("rm", ["-r", path.join(repo.repoPath, "dir")]);
+        const manager = managerFor(repo);
+        await manager.stage("dir", false);
+        expect(await repo.raw(["diff", "--cached", "--name-status"])).toBe(
+            "D\tdir/a.md\nD\tdir/sub/b.md"
+        );
+    });
+});

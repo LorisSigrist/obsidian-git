@@ -7,6 +7,7 @@ import { MODE_GITLINK, MODE_SYMLINK } from "./model";
 import type { Change, FlatEntry, Repository } from "./repository";
 import { modeString } from "./repository";
 import { hash_object } from "./wasm";
+import { settledStat } from "./worktree";
 
 /** Local changes or untracked files that a checkout would overwrite. */
 export class CheckoutConflictError extends GitError {
@@ -136,7 +137,11 @@ export async function checkoutTree(
         index.conflicts.delete(path);
         index.entries.set(
             path,
-            entryFor(path, after, await repo.fs.stat(vaultPath))
+            entryFor(
+                path,
+                after,
+                (await settledStat(repo, vaultPath, after.oid)) ?? null
+            )
         );
     }
     await pruneEmptyDirs(repo, emptied);

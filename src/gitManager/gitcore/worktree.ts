@@ -52,6 +52,42 @@ function isUnder(path: string, dir: string): boolean {
 }
 
 /**
+ * The stat to cache for a file whose content was just read (and hashed to
+ * `oid`): only if the file did not change while it was being read, otherwise
+ * undefined so the next status hashes it again. This keeps an edit that lands
+ * mid-read from hiding behind a fresh stat with a stale oid.
+ */
+export async function settledStat(
+    repo: Repository,
+    vaultPath: string,
+    oid: string
+): Promise<FileStat | undefined> {
+    const before = await repo.fs.stat(vaultPath);
+    if (before?.type !== "file") return undefined;
+    const data = await repo.fs.read(vaultPath);
+    if (!data || hash_object("blob", data) !== oid) return undefined;
+    const after = await repo.fs.stat(vaultPath);
+    if (!after || after.mtime !== before.mtime || after.size !== before.size)
+        return undefined;
+    return before;
+}
+
+/**
+ * Remove index entries that cannot coexist with a file at `path`: entries
+ * below it (it was a directory) and entries at its ancestors (one of them was
+ * a file). `git add` replaces those too.
+ */
+export function dropClashingEntries(index: GitIndex, path: string): void {
+    for (const p of [...index.entries.keys(), ...index.conflicts.keys()]) {
+        if (p.startsWith(path + "/")) unstageEntry(index, p);
+    }
+    const parts = path.split("/");
+    for (let i = 1; i < parts.length; i++) {
+        unstageEntry(index, parts.slice(0, i).join("/"));
+    }
+}
+
+/**
  * Stage the working-tree state of `paths` (files or directories): new and
  * modified files are added, missing ones removed. Untracked ignored files are
  * skipped, as `git add` without `--force` would.
@@ -78,7 +114,13 @@ export async function stagePaths(
         } else if (stat) {
             await stageFile(repo, index, path, ignore);
         } else {
-            unstageEntry(index, path);
+            // Gone: a deleted file, or a deleted directory and everything in it.
+            for (const p of [
+                ...index.entries.keys(),
+                ...index.conflicts.keys(),
+            ]) {
+                if (isUnder(p, path)) unstageEntry(index, p);
+            }
         }
     }
 }
@@ -93,16 +135,26 @@ async function stageFile(
     const tracked = existing !== undefined || index.conflicts.has(path);
     if (!tracked && (await ignore.isIgnored(path))) return;
     const vaultPath = repo.vaultPath(path);
+    // Stat before reading: a later edit then shows up as a stat change.
+    const before = await repo.fs.stat(vaultPath);
     const data = await repo.fs.read(vaultPath);
-    const stat = await repo.fs.stat(vaultPath);
-    if (!data || !stat) {
+    const after = await repo.fs.stat(vaultPath);
+    if (!data || !after) {
         unstageEntry(index, path);
         return;
     }
+    const settled =
+        before !== null &&
+        before.mtime === after.mtime &&
+        before.size === after.size;
     const oid = await repo.objects.write("blob", data);
     const mode = existing?.mode === 0o100755 ? 0o100755 : 0o100644;
+    dropClashingEntries(index, path);
     index.conflicts.delete(path);
-    index.entries.set(path, newEntry(path, oid, mode, stat));
+    index.entries.set(
+        path,
+        newEntry(path, oid, mode, settled ? before : undefined)
+    );
 }
 
 /** Remove a path from the index entirely (`git rm --cached`). */
@@ -149,12 +201,8 @@ export async function resetPaths(
             continue;
         }
         // Keep the stat cache valid if the working file is HEAD's version.
-        const stat = await repo.fs.stat(repo.vaultPath(path));
-        let fileStat: FileStat | undefined;
-        if (stat?.type === "file") {
-            const data = await repo.fs.read(repo.vaultPath(path));
-            if (data && hash_object("blob", data) === h.oid) fileStat = stat;
-        }
+        const fileStat = await settledStat(repo, repo.vaultPath(path), h.oid);
+        dropClashingEntries(index, path);
         index.conflicts.delete(path);
         index.entries.set(
             path,
@@ -181,8 +229,13 @@ export async function restoreFromIndex(
         if (!current || hash_object("blob", current) !== entry.oid) {
             await repo.fs.write(vaultPath, data);
         }
-        const stat = await repo.fs.stat(vaultPath);
-        if (stat) index.entries.set(path, { ...entry, ...statFields(stat) });
+        const stat = await settledStat(repo, vaultPath, entry.oid);
+        index.entries.set(
+            path,
+            stat
+                ? { ...entry, ...statFields(stat) }
+                : { ...entry, mtimeSec: 0, mtimeNsec: 0, size: 0 }
+        );
     }
 }
 
@@ -239,12 +292,21 @@ export async function writeTree(
         const parts = e.path.split("/");
         let dir = root;
         for (const part of parts.slice(0, -1)) {
+            if (dir.files.some((f) => f.name === part)) {
+                throw new Error(
+                    `Index has both a file and a folder at ${part}`
+                );
+            }
             let next = dir.dirs.get(part);
             if (!next) {
                 next = { files: [], dirs: new Map() };
                 dir.dirs.set(part, next);
             }
             dir = next;
+        }
+        const name = parts[parts.length - 1]!;
+        if (dir.dirs.has(name)) {
+            throw new Error(`Index has both a file and a folder at ${e.path}`);
         }
         dir.files.push({
             mode: e.mode.toString(8),
@@ -271,9 +333,23 @@ export function person(name: string, email: string, date = new Date()): Person {
     };
 }
 
-/** Normalize a commit message the way `git commit` does (trailing whitespace, final newline). */
+/**
+ * Clean a commit message like `git commit -m` ("whitespace" cleanup): strip
+ * trailing whitespace on each line, collapse runs of blank lines, drop leading
+ * and trailing blank lines. An empty result aborts, as in git.
+ */
 export function cleanMessage(message: string): string {
-    return message.replace(/[ \t]+$/gm, "").replace(/\s+$/, "") + "\n";
+    const lines = message.split("\n").map((l) => l.replace(/\s+$/, ""));
+    const out: string[] = [];
+    for (const line of lines) {
+        if (line === "" && (out.length === 0 || out.last() === "")) continue;
+        out.push(line);
+    }
+    while (out.last() === "") out.pop();
+    if (out.length === 0) {
+        throw new Error("Aborting commit due to empty commit message.");
+    }
+    return out.join("\n") + "\n";
 }
 
 export async function writeCommit(
