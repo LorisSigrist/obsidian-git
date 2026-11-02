@@ -13,6 +13,12 @@ import {
     type TestRepo,
 } from "../helpers/gitRepo";
 import { createWasmGitManager } from "../helpers/wasmGit";
+import { nodeHttp, startGitHttpServer } from "../helpers/gitHttpServer";
+import { fetchRemote } from "../../src/gitManager/gitcore/remote";
+import {
+    PushRejectedError,
+    UserCanceledError,
+} from "../../src/gitManager/gitcore/errors";
 
 function managerFor(repo: TestRepo): WasmGit {
     return createWasmGitManager(repo.repoPath, {
@@ -891,5 +897,240 @@ describe("WasmGit phase 2 review regressions", { timeout: 30_000 }, () => {
         expect(await repo.raw(["diff", "--cached", "--name-status"])).toBe(
             "D\tdir/a.md\nD\tdir/sub/b.md"
         );
+    });
+});
+
+describe("WasmGit fetch and push over smart HTTP", { timeout: 60_000 }, () => {
+    async function served(auth?: { username: string; password: string }) {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const server = await startGitHttpServer(repo.dir, auth);
+        await repo.raw([
+            "remote",
+            "set-url",
+            "origin",
+            server.url("remote.git"),
+        ]);
+        const ctx = createWasmGitManager(repo.repoPath, {
+            vaultPath: repo.dir,
+            basePath: "worktree",
+        });
+        ctx.manager.http = nodeHttp;
+        ctx.plugin.settings.disablePopups = true;
+        ctx.plugin.localStorage = {
+            ...ctx.plugin.localStorage,
+            getUsername: () => auth?.username ?? null,
+        } as unknown as typeof ctx.plugin.localStorage;
+        (
+            ctx.plugin as unknown as { gitServerPassword: unknown }
+        ).gitServerPassword = {
+            get: () => auth?.password ?? null,
+            set: async () => {},
+        };
+        /** A second clone that pushes to the remote over the filesystem. */
+        const other = path.join(repo.dir, "other");
+        await repo.raw(["clone", "--quiet", repo.remotePath, other]);
+        const otherGit = (...args: string[]) =>
+            execFileSync("git", args, { cwd: other, encoding: "utf8" }).trim();
+        otherGit("config", "user.name", "Other");
+        otherGit("config", "user.email", "other@example.com");
+        return { repo, server, other, otherGit, ...ctx };
+    }
+
+    it("fetches new commits, packs and deltas into the remote-tracking ref", async () => {
+        const { repo, server, other, otherGit, manager } = await served();
+        try {
+            const big = randomBytes(2_500_000);
+            writeFileSync(path.join(other, "big.bin"), big);
+            writeFileSync(path.join(other, "remote.md"), "remote\n");
+            otherGit("add", ".");
+            otherGit("commit", "-qm", "remote work");
+            big[100] = big[100]! ^ 1;
+            writeFileSync(path.join(other, "big.bin"), big);
+            otherGit("commit", "-qam", "remote edit");
+            otherGit("push", "-q", "origin", "main");
+
+            await manager.fetch();
+            expect(await repo.raw(["rev-parse", "origin/main"])).toBe(
+                otherGit("rev-parse", "HEAD")
+            );
+            expect(await repo.raw(["show", "origin/main:remote.md"])).toBe(
+                "remote"
+            );
+            await expectFsckClean(repo);
+            // Nothing new: no pack is requested.
+            const before = server.requests.length;
+            await manager.fetch();
+            expect(server.requests.slice(before)).toEqual([
+                "GET /remote.git/info/refs",
+            ]);
+            // The fetched objects are readable through our own pack reader.
+            expect(await manager.show("origin/main", "remote.md", false)).toBe(
+                "remote\n"
+            );
+        } finally {
+            await server.close();
+        }
+    });
+
+    it("pushes the current branch and reports up to date afterwards", async () => {
+        const { repo, server, manager } = await served();
+        try {
+            await repo.writeAndCommit("a.md", "a\n", "local a");
+            writeFileSync(
+                path.join(repo.repoPath, "pic.bin"),
+                randomBytes(300_000)
+            );
+            await repo.raw(["add", "pic.bin"]);
+            await repo.git.commit("local pic");
+
+            await expect(manager.push()).resolves.toEqual({
+                status: "pushed",
+                files: 2,
+            });
+            expect(
+                execFileSync("git", ["rev-parse", "main"], {
+                    cwd: repo.remotePath,
+                    encoding: "utf8",
+                }).trim()
+            ).toBe(await repo.head());
+            expect(await repo.raw(["rev-parse", "origin/main"])).toBe(
+                await repo.head()
+            );
+            execFileSync("git", ["fsck", "--strict"], { cwd: repo.remotePath });
+            await expect(manager.push()).resolves.toEqual({
+                status: "up-to-date",
+            });
+        } finally {
+            await server.close();
+        }
+    });
+
+    it("rejects a push that is not a fast-forward", async () => {
+        const { repo, server, other, otherGit, manager } = await served();
+        try {
+            writeFileSync(path.join(other, "theirs.md"), "theirs\n");
+            otherGit("add", ".");
+            otherGit("commit", "-qm", "theirs");
+            otherGit("push", "-q", "origin", "main");
+            await repo.writeAndCommit("mine.md", "mine\n", "mine");
+
+            await expect(manager.push()).rejects.toBeInstanceOf(
+                PushRejectedError
+            );
+            await manager.fetch();
+            await expect(manager.push()).rejects.toMatchObject({
+                reason: "not-fast-forward",
+            });
+        } finally {
+            await server.close();
+        }
+    });
+
+    it("pushes a new branch when setting its upstream", async () => {
+        const { repo, server, manager } = await served();
+        try {
+            await repo.raw(["checkout", "-q", "-b", "topic"]);
+            await repo.writeAndCommit("t.md", "t\n", "topic work");
+            await manager.updateUpstreamBranch("origin/topic");
+            expect(
+                execFileSync("git", ["rev-parse", "topic"], {
+                    cwd: repo.remotePath,
+                    encoding: "utf8",
+                }).trim()
+            ).toBe(await repo.head());
+            expect(
+                await repo.raw([
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "topic@{upstream}",
+                ])
+            ).toBe("origin/topic");
+        } finally {
+            await server.close();
+        }
+    });
+
+    it("authenticates with stored credentials and asks again on failure", async () => {
+        const { repo, server, manager } = await served({
+            username: "me",
+            password: "s3cret",
+        });
+        try {
+            await repo.writeAndCommit("a.md", "a\n", "a");
+            await expect(manager.push()).resolves.toMatchObject({
+                status: "pushed",
+            });
+            await manager.fetch();
+
+            // Wrong credentials and the user cancels the prompt.
+            const r = await repoOf(manager);
+            await expect(
+                fetchRemote(r, {
+                    url: server.url("remote.git"),
+                    http: nodeHttp,
+                    remote: "origin",
+                    refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+                    auth: {
+                        onAuth: () => ({ username: "me", password: "wrong" }),
+                        onAuthFailure: () =>
+                            Promise.resolve({ cancel: true as const }),
+                    },
+                })
+            ).rejects.toBeInstanceOf(UserCanceledError);
+
+            // Credentials in the URL are used as Basic auth.
+            const withCreds = server
+                .url("remote.git")
+                .replace("http://", "http://me:s3cret@");
+            await expect(
+                fetchRemote(r, {
+                    url: withCreds,
+                    http: nodeHttp,
+                    remote: "origin",
+                    refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+                })
+            ).resolves.toBeDefined();
+        } finally {
+            await server.close();
+        }
+    });
+
+    it("fetches a shallow history with a depth", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        for (let i = 0; i < 5; i++) {
+            await repo.appendAndCommit("note.md", `${i}\n`, `c${i}`);
+        }
+        await repo.git.push(["--quiet"]);
+        const server = await startGitHttpServer(repo.dir);
+        try {
+            const fresh = path.join(repo.dir, "fresh");
+            execFileSync("git", ["init", "-q", "-b", "main", fresh]);
+            const { manager } = createWasmGitManager(fresh, {
+                vaultPath: repo.dir,
+                basePath: "fresh",
+            });
+            const r = await repoOf(manager);
+            await fetchRemote(r, {
+                url: server.url("remote.git"),
+                http: nodeHttp,
+                remote: "origin",
+                refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+                depth: 2,
+            });
+            const log = execFileSync(
+                "git",
+                ["log", "--format=%s", "refs/remotes/origin/main"],
+                { cwd: fresh, encoding: "utf8" }
+            ).trim();
+            expect(log).toBe("c4\nc3");
+            expect(
+                readFileSync(path.join(fresh, ".git", "shallow"), "utf8").trim()
+            ).toHaveLength(40);
+            execFileSync("git", ["fsck", "--strict", "--no-dangling"], {
+                cwd: fresh,
+            });
+        } finally {
+            await server.close();
+        }
     });
 });

@@ -1,0 +1,490 @@
+// Fetching and pushing over smart HTTP.
+
+import { PushRejectedError } from "./errors";
+import { isAncestor } from "./history";
+import { MODE_GITLINK, MODE_TREE } from "./model";
+import type { Repository } from "./repository";
+import {
+    concat,
+    demuxSideband,
+    discoverRefs,
+    FLUSH,
+    GitHttpSession,
+    pktLine,
+    PktReader,
+    type AuthCallbacks,
+    type HttpClient,
+    type RemoteRefs,
+} from "./transport";
+import { PackIndexer, PackWriter } from "./wasm";
+
+const ZERO = "0".repeat(40);
+const AGENT = "agent=git/obsidian-git";
+
+export interface RemoteOptions {
+    url: string;
+    http: HttpClient;
+    auth?: AuthCallbacks;
+    onProgress?: (message: string) => void;
+}
+
+interface Refspec {
+    force: boolean;
+    src: string;
+    dst: string;
+}
+
+export function parseRefspec(spec: string): Refspec {
+    const force = spec.startsWith("+");
+    const [src, dst] = (force ? spec.slice(1) : spec).split(":");
+    return { force, src: src ?? "", dst: dst ?? "" };
+}
+
+/** The local name for remote ref `name` under `spec`, or undefined. */
+function mapRef(spec: Refspec, name: string): string | undefined {
+    const star = spec.src.indexOf("*");
+    if (star < 0) return name === spec.src ? spec.dst : undefined;
+    const prefix = spec.src.slice(0, star);
+    const suffix = spec.src.slice(star + 1);
+    if (
+        !name.startsWith(prefix) ||
+        !name.endsWith(suffix) ||
+        name.length < prefix.length + suffix.length
+    )
+        return undefined;
+    const middle = name.slice(prefix.length, name.length - suffix.length);
+    return spec.dst.replace("*", middle);
+}
+
+async function readShallow(repo: Repository): Promise<Set<string>> {
+    const text = await repo.fs.readText(`${repo.gitdir}/shallow`);
+    return new Set(
+        (text ?? "").split("\n").filter((l) => /^[0-9a-f]{40}$/.test(l))
+    );
+}
+
+async function writeShallow(repo: Repository, oids: Set<string>) {
+    const path = `${repo.gitdir}/shallow`;
+    if (oids.size === 0) await repo.fs.remove(path);
+    else await repo.fs.write(path, [...oids].sort().join("\n") + "\n");
+}
+
+/** Commits we have, newest first, to tell the server what not to send. */
+async function haves(repo: Repository, limit = 256): Promise<string[]> {
+    const tips = new Set<string>();
+    for (const prefix of ["refs/heads/", "refs/remotes/", "refs/tags/"]) {
+        for (const name of await repo.refs.list(prefix)) {
+            const oid = await repo.refs.resolveFull(prefix + name);
+            if (oid && (await repo.objects.has(oid))) tips.add(oid);
+        }
+    }
+    const out: string[] = [];
+    const queue: { oid: string; time: number }[] = [];
+    const seen = new Set<string>();
+    const push = async (oid: string) => {
+        if (seen.has(oid) || !(await repo.objects.has(oid))) return;
+        seen.add(oid);
+        const obj = await repo.objects.read(oid);
+        if (obj.type !== "commit") return;
+        const c = await repo.objects.readCommit(oid);
+        queue.push({ oid, time: c.committer.timestamp });
+    };
+    for (const t of tips) await push(t);
+    while (queue.length > 0 && out.length < limit) {
+        queue.sort((a, b) => b.time - a.time);
+        const { oid } = queue.shift()!;
+        out.push(oid);
+        for (const p of (await repo.objects.readCommit(oid)).parents) {
+            await push(p);
+        }
+    }
+    return out;
+}
+
+/**
+ * Store a pack: append it to a temporary file while indexing it in WASM,
+ * resolve deltas by reading back ranges, then publish the pack and its index.
+ * Returns the number of objects.
+ */
+export async function storePack(
+    repo: Repository,
+    chunks: Uint8Array[]
+): Promise<number> {
+    const dir = repo.objects.packDir;
+    const tmp = `${dir}/tmp_pack_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const ix = new PackIndexer();
+    try {
+        const pending: Uint8Array[] = [];
+        let pendingSize = 0;
+        let size = 0;
+        const flush = async () => {
+            if (pendingSize === 0) return;
+            await repo.fs.append(tmp, concat(pending));
+            pending.length = 0;
+            pendingSize = 0;
+        };
+        for (const chunk of chunks) {
+            ix.push(chunk);
+            pending.push(chunk);
+            pendingSize += chunk.length;
+            size += chunk.length;
+            if (pendingSize >= 1 << 20) await flush();
+        }
+        await flush();
+        ix.finish();
+        const count = ix.object_count();
+        if (count === 0) {
+            await repo.fs.remove(tmp);
+            return 0;
+        }
+        for (let req = ix.next_read(); req; req = ix.next_read()) {
+            ix.provide(await repo.fs.readRange(tmp, size, req[0]!, req[1]!));
+        }
+        const name = `pack-${ix.checksum_hex()}`;
+        const idx = ix.build_idx();
+        if (await repo.fs.exists(`${dir}/${name}.pack`)) {
+            await repo.fs.remove(tmp);
+        } else {
+            // The pack goes first: an index without its pack would be broken.
+            await repo.fs.rename(tmp, `${dir}/${name}.pack`);
+        }
+        await repo.fs.write(`${dir}/${name}.idx`, idx);
+        repo.objects.invalidatePacks();
+        return count;
+    } catch (e) {
+        await repo.fs.remove(tmp).catch(() => undefined);
+        throw e;
+    } finally {
+        ix.free();
+    }
+}
+
+export interface FetchResult {
+    remoteRefs: RemoteRefs;
+    /** Local refs that changed: name → [old (or undefined), new]. */
+    updated: Map<string, [string | undefined, string]>;
+}
+
+/**
+ * `git fetch <remote>`: download what the refspecs need and update the
+ * remote-tracking refs. With `depth`, fetch a shallow history.
+ */
+export async function fetchRemote(
+    repo: Repository,
+    opts: RemoteOptions & {
+        remote: string;
+        refspecs: string[];
+        depth?: number;
+    }
+): Promise<FetchResult> {
+    const session = new GitHttpSession(opts.http, opts.url, opts.auth);
+    const remoteRefs = await discoverRefs(session, "git-upload-pack");
+    const specs = opts.refspecs.map(parseRefspec);
+
+    const targets: { local: string; oid: string; force: boolean }[] = [];
+    for (const [name, oid] of remoteRefs.refs) {
+        if (!name.startsWith("refs/") || name.endsWith("^{}")) continue;
+        for (const spec of specs) {
+            const local = mapRef(spec, name);
+            if (local) targets.push({ local, oid, force: spec.force });
+        }
+    }
+
+    const wants = new Set<string>();
+    for (const t of targets) {
+        if (!(await repo.objects.has(t.oid))) wants.add(t.oid);
+    }
+
+    if (wants.size > 0) {
+        const caps = remoteRefs.capabilities;
+        const shallow = await readShallow(repo);
+        const useShallow = opts.depth !== undefined || shallow.size > 0;
+        if (useShallow && !caps.has("shallow")) {
+            throw new Error("The remote does not support shallow fetches.");
+        }
+        const myCaps = ["ofs-delta", AGENT];
+        if (caps.has("side-band-64k")) myCaps.push("side-band-64k");
+        if (caps.has("no-progress") && !opts.onProgress)
+            myCaps.push("no-progress");
+        if (useShallow) myCaps.push("shallow");
+
+        const lines: Uint8Array[] = [];
+        [...wants].forEach((oid, i) =>
+            lines.push(
+                pktLine(`want ${oid}${i === 0 ? " " + myCaps.join(" ") : ""}\n`)
+            )
+        );
+        for (const oid of shallow) lines.push(pktLine(`shallow ${oid}\n`));
+        if (opts.depth !== undefined) {
+            lines.push(pktLine(`deepen ${opts.depth}\n`));
+        }
+        lines.push(FLUSH);
+        for (const oid of await haves(repo))
+            lines.push(pktLine(`have ${oid}\n`));
+        lines.push(pktLine("done\n"));
+
+        const res = await session.request({
+            path: "/git-upload-pack",
+            method: "POST",
+            headers: {
+                "Content-Type": "application/x-git-upload-pack-request",
+                Accept: "application/x-git-upload-pack-result",
+            },
+            body: concat(lines),
+        });
+        const reader = new PktReader(res.body);
+        if (opts.depth !== undefined) {
+            // shallow-update section, ended by a flush.
+            for (
+                let line = reader.nextLine();
+                line !== null;
+                line = reader.nextLine()
+            ) {
+                const [kind, oid] = line.split(" ");
+                if (kind === "shallow" && oid) shallow.add(oid);
+                else if (kind === "unshallow" && oid) shallow.delete(oid);
+            }
+        }
+        // One ACK or NAK closes the negotiation (no multi_ack requested).
+        const ack = reader.nextLine();
+        if (ack === null || !(ack === "NAK" || ack.startsWith("ACK "))) {
+            throw new Error(`Unexpected negotiation response: ${ack}`);
+        }
+        const chunks: Uint8Array[] = [];
+        if (myCaps.includes("side-band-64k")) {
+            demuxSideband(reader, (c) => chunks.push(c), opts.onProgress);
+        } else {
+            chunks.push(reader.rest());
+        }
+        await storePack(repo, chunks);
+        if (useShallow) await writeShallow(repo, shallow);
+    }
+
+    const updated = new Map<string, [string | undefined, string]>();
+    const fetchHead: string[] = [];
+    for (const t of targets) {
+        const old = (await repo.refs.resolveFull(t.local)) ?? undefined;
+        fetchHead.push(`${t.oid}\t\t${t.local}`);
+        if (old === t.oid) continue;
+        if (
+            old &&
+            !t.force &&
+            !(await isAncestor(repo, old, t.oid).catch(() => false))
+        )
+            continue; // git refuses non-fast-forward updates without "+"
+        await repo.refs.write(t.local, t.oid);
+        updated.set(t.local, [old, t.oid]);
+    }
+    if (fetchHead.length > 0) {
+        await repo.fs.write(
+            `${repo.gitdir}/FETCH_HEAD`,
+            fetchHead.join("\n") + "\n"
+        );
+    }
+    // Record the remote's default branch, as `git clone` does.
+    const remoteHead = `refs/remotes/${opts.remote}/HEAD`;
+    if (
+        remoteRefs.headTarget &&
+        (await repo.refs.readRaw(remoteHead)) === null
+    ) {
+        const local = specs
+            .map((s) => mapRef(s, remoteRefs.headTarget!))
+            .find((x) => x !== undefined);
+        if (local && (await repo.refs.readRaw(local)) !== null) {
+            await repo.refs.writeSymbolic(remoteHead, local);
+        }
+    }
+    return { remoteRefs, updated };
+}
+
+/** Objects reachable from `oid`'s tree that are not in `have`, added to `out`. */
+async function collectTree(
+    repo: Repository,
+    tree: string,
+    have: Set<string>,
+    out: Set<string>
+): Promise<void> {
+    if (have.has(tree) || out.has(tree)) return;
+    out.add(tree);
+    for (const e of await repo.objects.readTree(tree)) {
+        if (e.mode === MODE_GITLINK) continue;
+        if (e.mode === MODE_TREE) await collectTree(repo, e.oid, have, out);
+        else if (!have.has(e.oid)) out.add(e.oid);
+    }
+}
+
+/** Every tree and blob reachable from a tree. */
+async function allTreeObjects(
+    repo: Repository,
+    tree: string,
+    out: Set<string>
+): Promise<void> {
+    if (out.has(tree)) return;
+    out.add(tree);
+    for (const e of await repo.objects.readTree(tree)) {
+        if (e.mode === MODE_GITLINK) continue;
+        if (e.mode === MODE_TREE) await allTreeObjects(repo, e.oid, out);
+        else out.add(e.oid);
+    }
+}
+
+/** The objects a remote that has `remoteTips` needs to get to `tip`. */
+async function objectsToSend(
+    repo: Repository,
+    tip: string,
+    remoteTips: string[]
+): Promise<string[]> {
+    // Commits the remote has (that we know of).
+    const known = new Set<string>();
+    const stack: string[] = [];
+    for (const t of remoteTips) {
+        if (t !== ZERO && (await repo.objects.has(t))) {
+            const obj = await repo.objects.read(t);
+            if (obj.type === "commit" && !known.has(t)) {
+                known.add(t);
+                stack.push(t);
+            }
+        }
+    }
+    while (stack.length > 0) {
+        for (const p of (await repo.objects.readCommit(stack.pop()!)).parents) {
+            if (known.has(p) || !(await repo.objects.has(p))) continue;
+            known.add(p);
+            stack.push(p);
+        }
+    }
+    // New commits, and the remote-side commits they build on.
+    const commits: string[] = [];
+    const boundary = new Set<string>();
+    const seen = new Set<string>([tip]);
+    const walk = [tip];
+    while (walk.length > 0) {
+        const oid = walk.pop()!;
+        if (known.has(oid)) {
+            boundary.add(oid);
+            continue;
+        }
+        commits.push(oid);
+        for (const p of (await repo.objects.readCommit(oid)).parents) {
+            if (seen.has(p) || !(await repo.objects.has(p))) continue;
+            seen.add(p);
+            walk.push(p);
+        }
+    }
+    const have = new Set<string>();
+    for (const b of boundary) {
+        await allTreeObjects(
+            repo,
+            (await repo.objects.readCommit(b)).tree,
+            have
+        );
+    }
+    const out = new Set<string>(commits);
+    for (const c of commits) {
+        await collectTree(
+            repo,
+            (await repo.objects.readCommit(c)).tree,
+            have,
+            out
+        );
+    }
+    return [...out];
+}
+
+export type PushOutcome = "up-to-date" | "pushed";
+
+/**
+ * Push local ref `localRef` to `remoteRef` on the remote (fast-forward only
+ * unless `force`). Throws PushRejectedError when the remote or the
+ * fast-forward check refuses.
+ */
+export async function pushRef(
+    repo: Repository,
+    opts: RemoteOptions & {
+        localRef: string;
+        remoteRef: string;
+        force?: boolean;
+    }
+): Promise<PushOutcome> {
+    const session = new GitHttpSession(opts.http, opts.url, opts.auth);
+    const remoteRefs = await discoverRefs(session, "git-receive-pack");
+    const next = await repo.refs.resolveFull(opts.localRef);
+    if (!next)
+        throw new Error(`Nothing to push: ${opts.localRef} does not exist`);
+    const old = remoteRefs.refs.get(opts.remoteRef) ?? ZERO;
+    if (old === next) return "up-to-date";
+    if (old !== ZERO && !opts.force) {
+        if (!(await repo.objects.has(old))) {
+            throw new PushRejectedError(
+                "fetch first: the remote contains work that you do not have locally"
+            );
+        }
+        if (!(await isAncestor(repo, old, next))) {
+            throw new PushRejectedError("not-fast-forward");
+        }
+    }
+
+    const oids = await objectsToSend(repo, next, [...remoteRefs.refs.values()]);
+    const writer = new PackWriter(oids.length);
+    const parts: Uint8Array[] = [writer.header()];
+    try {
+        for (const oid of oids) {
+            const obj = await repo.objects.read(oid);
+            parts.push(writer.entry(obj.type, obj.data));
+        }
+        parts.push(writer.finish());
+    } finally {
+        writer.free();
+    }
+
+    const caps = ["report-status", AGENT];
+    const sideband = remoteRefs.capabilities.has("side-band-64k");
+    if (sideband) caps.push("side-band-64k");
+    const body = concat([
+        pktLine(`${old} ${next} ${opts.remoteRef}\0${caps.join(" ")}\n`),
+        FLUSH,
+        ...parts,
+    ]);
+    const res = await session.request({
+        path: "/git-receive-pack",
+        method: "POST",
+        headers: {
+            "Content-Type": "application/x-git-receive-pack-request",
+            Accept: "application/x-git-receive-pack-result",
+        },
+        body,
+    });
+
+    let report: Uint8Array;
+    if (sideband) {
+        const data: Uint8Array[] = [];
+        demuxSideband(
+            new PktReader(res.body),
+            (c) => data.push(c),
+            opts.onProgress
+        );
+        report = concat(data);
+    } else {
+        report = res.body;
+    }
+    const reader = new PktReader(report);
+    const unpack = reader.nextLine();
+    if (unpack !== "unpack ok") {
+        throw new Error(`The remote could not unpack the push: ${unpack}`);
+    }
+    for (
+        let line = reader.nextLine();
+        line !== null;
+        line = reader.nextLine()
+    ) {
+        if (line.startsWith("ng ")) {
+            const reason = line.slice(3 + opts.remoteRef.length + 1);
+            throw new PushRejectedError(
+                /non-fast-forward|fetch first/.test(reason)
+                    ? "not-fast-forward"
+                    : reason
+            );
+        }
+    }
+    return "pushed";
+}

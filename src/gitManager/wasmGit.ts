@@ -1,5 +1,5 @@
 import { createPatch } from "diff";
-import { normalizePath, Notice } from "obsidian";
+import { normalizePath, Notice, requestUrl } from "obsidian";
 import type ObsidianGit from "../main";
 import type {
     BranchInfo,
@@ -25,6 +25,10 @@ import type { Person } from "./gitcore/model";
 import type { RangeReader } from "./gitcore/repoFs";
 import { Repository, type StatusRow } from "./gitcore/repository";
 import { checkoutTree } from "./gitcore/checkout";
+import { fetchRemote, pushRef } from "./gitcore/remote";
+import type { AuthCallbacks, HttpClient } from "./gitcore/transport";
+import { GeneralModal } from "../ui/modals/generalModal";
+import { splitRemoteBranch } from "../utils";
 import { isAncestor } from "./gitcore/history";
 import {
     cleanMessage,
@@ -55,6 +59,31 @@ function isoDate(p: Person): string {
             ? "Z"
             : `${p.timezone.slice(0, 3)}:${p.timezone.slice(3, 5)}`)
     );
+}
+
+function toArrayBuffer(u: Uint8Array): ArrayBuffer {
+    return u.byteOffset === 0 && u.byteLength === u.buffer.byteLength
+        ? (u.buffer as ArrayBuffer)
+        : u.slice().buffer;
+}
+
+// If `buffer` starts with the gzip magic bytes, inflate it. A smart-HTTP body
+// never starts with those bytes (it begins with a pkt-line length or "PACK"),
+// and some platforms inflate transparently while leaving the header in place,
+// so this is keyed on the content rather than Content-Encoding.
+async function inflateIfGzipped(buffer: ArrayBuffer): Promise<ArrayBuffer> {
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length < 2 || bytes[0] !== 0x1f || bytes[1] !== 0x8b) {
+        return buffer;
+    }
+    try {
+        const stream = new Blob([buffer])
+            .stream()
+            .pipeThrough(new DecompressionStream("gzip"));
+        return await new Response(stream).arrayBuffer();
+    } catch {
+        return buffer;
+    }
 }
 
 /**
@@ -949,6 +978,182 @@ export class WasmGit extends GitManager {
         }
     }
 
+    // ---- Network ----
+
+    /** Performs HTTP requests; tests replace it with one backed by Node's fetch. */
+    http: HttpClient = async ({ url, method, headers, body }) => {
+        const res = await requestUrl({
+            url,
+            method,
+            // Ask the server not to compress: the protocol parser needs the
+            // raw bytes, and not every platform inflates transparently.
+            headers: { "Accept-Encoding": "identity", ...headers },
+            body: body ? toArrayBuffer(body) : undefined,
+            throw: false,
+        });
+        return {
+            status: res.status,
+            headers: res.headers,
+            body: new Uint8Array(await inflateIfGzipped(res.arrayBuffer)),
+        };
+    };
+
+    private authCallbacks(): AuthCallbacks {
+        return {
+            onAuth: () => ({
+                username: this.plugin.localStorage.getUsername() ?? undefined,
+                password: this.plugin.gitServerPassword.get() ?? undefined,
+            }),
+            onAuthFailure: async () => {
+                new Notice(
+                    "Authentication failed. Please try with different credentials"
+                );
+                const username = await new GeneralModal(this.plugin, {
+                    placeholder: "Specify your username",
+                }).openAndGetResult();
+                if (username) {
+                    const password = await new GeneralModal(this.plugin, {
+                        placeholder:
+                            "Specify your password/personal access token",
+                        obscure: true,
+                    }).openAndGetResult();
+                    if (password) {
+                        this.plugin.localStorage.setUsername(username);
+                        await this.plugin.gitServerPassword.set(password);
+                        return { username, password };
+                    }
+                }
+                return { cancel: true };
+            },
+        };
+    }
+
+    private async remoteOptions(
+        remote: string,
+        notice: Notice | undefined,
+        action: string
+    ) {
+        const url = await this.getRemoteUrl(remote);
+        if (!url) throw new NotFoundError(`remote ${remote}`);
+        if (!/^https?:\/\//.test(url)) {
+            throw new Error(
+                `Only HTTP(S) remotes are supported on mobile, but ${remote} is ${url}`
+            );
+        }
+        return {
+            url,
+            http: this.http,
+            auth: this.authCallbacks(),
+            onProgress: notice
+                ? (message: string) => {
+                      const last = message
+                          .split(/[\r\n]/)
+                          .filter(Boolean)
+                          .last();
+                      if (last) notice.setMessage(`${action}: ${last}`);
+                  }
+                : undefined,
+        };
+    }
+
+    async fetch(remote?: string): Promise<void> {
+        const progressNotice = this.showNotice("Initializing fetch");
+        try {
+            const repo = await this.repo();
+            const name = remote ?? (await this.getCurrentRemote());
+            const config = await repo.readConfig();
+            const refspecs = config.getAll(`remote.${name}.fetch`);
+            await fetchRemote(repo, {
+                ...(await this.remoteOptions(name, progressNotice, "Fetching")),
+                remote: name,
+                refspecs:
+                    refspecs.length > 0
+                        ? refspecs
+                        : [`+refs/heads/*:refs/remotes/${name}/*`],
+            });
+        } finally {
+            progressNotice?.hide();
+        }
+    }
+
+    async push(): Promise<PushResult> {
+        const progressNotice = this.showNotice("Initializing push");
+        return this.withGitOperation(GitOperation.push, async () => {
+            try {
+                const { tracking, current, remote } = await this.branchInfo();
+                if (!current) return { status: "blocked", reason: "no-branch" };
+                if (!tracking) {
+                    this.plugin.log("No tracking branch found. Ignoring push.");
+                    return { status: "skipped", reason: "no-upstream" };
+                }
+                const numChangedFiles = (
+                    await this.getFileChangesCount(current, tracking)
+                ).length;
+                const repo = await this.repo();
+                const merge =
+                    (await repo.readConfig()).get(`branch.${current}.merge`) ??
+                    `refs/heads/${current}`;
+                const outcome = await this.pushTo(
+                    remote,
+                    current,
+                    merge,
+                    progressNotice
+                );
+                return outcome === "up-to-date" || numChangedFiles === 0
+                    ? { status: "up-to-date" }
+                    : { status: "pushed", files: numChangedFiles };
+            } finally {
+                progressNotice?.hide();
+            }
+        });
+    }
+
+    /** Push a local branch and record the result in the remote-tracking ref. */
+    private async pushTo(
+        remote: string,
+        branch: string,
+        remoteRef: string,
+        notice?: Notice
+    ) {
+        const repo = await this.repo();
+        const outcome = await pushRef(repo, {
+            ...(await this.remoteOptions(remote, notice, "Pushing")),
+            localRef: `refs/heads/${branch}`,
+            remoteRef,
+        });
+        const tip = await repo.refs.resolveFull(`refs/heads/${branch}`);
+        const tracking = remoteRef.replace(
+            /^refs\/heads\//,
+            `refs/remotes/${remote}/`
+        );
+        if (tip && tracking !== remoteRef) await repo.refs.write(tracking, tip);
+        return outcome;
+    }
+
+    async updateUpstreamBranch(remoteBranch: string): Promise<void> {
+        const [remote, branch] = splitRemoteBranch(remoteBranch);
+        const repo = await this.repo();
+        const current = await repo.refs.currentBranch();
+        if (!current)
+            throw new Error("No current branch to set an upstream for.");
+        // Like `push --set-upstream` when the remote branch does not exist yet.
+        if (
+            (await repo.refs.readRaw(`refs/remotes/${remote}/${branch}`)) ===
+            null
+        ) {
+            await this.pushTo(remote, current, `refs/heads/${branch}`);
+        }
+        const config = await repo.readConfig();
+        config.set(`branch.${current}.remote`, remote);
+        config.set(`branch.${current}.merge`, `refs/heads/${branch}`);
+        await repo.writeConfig(config);
+    }
+
+    private showNotice(message: string): Notice | undefined {
+        if (this.plugin.settings.disablePopups) return undefined;
+        return new Notice(message, this.noticeLength);
+    }
+
     // ---- Not yet implemented (later phases) ----
 
     private notYet(name: string): never {
@@ -958,19 +1163,10 @@ export class WasmGit extends GitManager {
     pull(): Promise<PullResult> {
         this.notYet("pull");
     }
-    push(): Promise<PushResult> {
-        this.notYet("push");
-    }
     init(): Promise<void> {
         this.notYet("init");
     }
     clone(_: string, __: string, ___?: number): Promise<void> {
         this.notYet("clone");
-    }
-    fetch(_?: string): Promise<void> {
-        this.notYet("fetch");
-    }
-    updateUpstreamBranch(_: string): Promise<void> {
-        this.notYet("updateUpstreamBranch");
     }
 }
