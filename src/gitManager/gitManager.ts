@@ -47,6 +47,9 @@ export abstract class GitManager {
 
     abstract isMergeInProgress(): Promise<boolean>;
 
+    /** End a conflicted merge, putting the files back to how they were before it. */
+    abstract abortMerge(): Promise<void>;
+
     abstract commitAll(_: {
         message: string;
         status?: Status;

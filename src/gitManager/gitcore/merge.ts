@@ -170,6 +170,10 @@ export async function mergeTrees(
                     continue;
                 }
             }
+        } else if (opts.strategy === "ours" || opts.strategy === "theirs") {
+            // Deleted on one side, changed on the other: the chosen side
+            // wins, whether it kept or deleted the file.
+            result = opts.strategy === "ours" ? oe : te;
         } else {
             // Deleted on one side, changed on the other: keep the change in
             // the working tree, but let the user decide.

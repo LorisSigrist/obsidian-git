@@ -19,6 +19,10 @@ describe("WasmGit pull and merge", { timeout: 300_000 }, () => {
     function puller(repo: TestRepo) {
         const ctx = createWasmGitManager(repo.repoPath);
         ctx.manager.fetch = () => Promise.resolve();
+        // pull fetches through this, with its own progress notice.
+        (
+            ctx.manager as unknown as { fetchWith: () => Promise<void> }
+        ).fetchWith = () => Promise.resolve();
         return ctx;
     }
     const readF = (repo: TestRepo, p: string) =>
@@ -149,10 +153,11 @@ describe("WasmGit pull and merge", { timeout: 300_000 }, () => {
         ]);
         await repo.raw(["reset", "--hard", oldHead]);
         const { manager } = puller(repo);
-        manager.fetch = () => {
-            repo.write("note.md", "edited during pull\n");
-            return Promise.resolve();
-        };
+        (manager as unknown as { fetchWith: () => Promise<void> }).fetchWith =
+            () => {
+                repo.write("note.md", "edited during pull\n");
+                return Promise.resolve();
+            };
         await expect(manager.pull()).rejects.toThrow(/uncommitted/);
         expect(await repo.head()).toBe(oldHead);
         expect(readF(repo, "note.md")).toBe("edited during pull\n");
@@ -399,6 +404,85 @@ describe("WasmGit pull and merge", { timeout: 300_000 }, () => {
         ]);
     });
 
+    /** Delete/modify and binary conflicts, plus a clean incoming change. */
+    async function conflictingRepo() {
+        const repo = withCleanup(await createRepoWithOrigin());
+        await repo.writeAndCommit("gone.md", "base\n", "base gone");
+        writeFileSync(
+            path.join(repo.repoPath, "img.bin"),
+            Buffer.from([0, 1, 2])
+        );
+        await repo.raw(["add", "img.bin"]);
+        await repo.git.commit("img");
+        await repo.git.checkoutLocalBranch("theirs");
+        await repo.writeAndCommit("gone.md", "they edited\n", "edit");
+        await repo.writeAndCommit("new.md", "theirs only\n", "add");
+        writeFileSync(
+            path.join(repo.repoPath, "img.bin"),
+            Buffer.from([0, 9, 9])
+        );
+        await repo.raw(["commit", "-qam", "their img"]);
+        const theirCommit = await repo.head();
+        await repo.git.checkout("main");
+        await repo.git.rm("gone.md");
+        writeFileSync(
+            path.join(repo.repoPath, "img.bin"),
+            Buffer.from([0, 7, 7])
+        );
+        await repo.raw(["commit", "-qam", "we delete and change img"]);
+        await repo.raw(["update-ref", "refs/remotes/origin/main", theirCommit]);
+        return repo;
+    }
+
+    it("takes the chosen side of delete/modify and binary conflicts", async () => {
+        for (const strategy of ["ours", "theirs"] as const) {
+            const repo = await conflictingRepo();
+            const { manager, plugin } = puller(repo);
+            plugin.settings.mergeStrategy = strategy;
+            await expect(manager.pull()).resolves.toMatchObject({
+                status: "updated",
+            });
+            if (strategy === "theirs") {
+                expect(readF(repo, "gone.md")).toBe("they edited\n");
+            } else {
+                expect(gone(repo, "gone.md")).toBe(true);
+            }
+            expect([
+                ...readFileSync(path.join(repo.repoPath, "img.bin")),
+            ]).toEqual(strategy === "theirs" ? [0, 9, 9] : [0, 7, 7]);
+            expect(readF(repo, "new.md")).toBe("theirs only\n");
+            expect(await repo.statusPorcelain()).toBe("");
+            await expectFsckClean(repo);
+        }
+    });
+
+    it("aborts a conflicted merge back to how the files were before", async () => {
+        const repo = await conflictingRepo();
+        const before = await repo.head();
+        const { manager, plugin } = puller(repo);
+        await expect(manager.pull()).rejects.toBeInstanceOf(GitConflictError);
+        expect(await manager.isMergeInProgress()).toBe(true);
+
+        await manager.abortMerge();
+        expect(await manager.isMergeInProgress()).toBe(false);
+        expect(await repo.head()).toBe(before);
+        expect(await repo.statusPorcelain()).toBe("");
+        expect(gone(repo, "gone.md")).toBe(true);
+        expect(gone(repo, "new.md")).toBe(true);
+        expect([...readFileSync(path.join(repo.repoPath, "img.bin"))]).toEqual([
+            0, 7, 7,
+        ]);
+        expect(await ourStatus(manager)).toEqual(await nativeStatus(repo));
+
+        // Then a pull that takes their side goes through.
+        plugin.settings.mergeStrategy = "theirs";
+        await expect(manager.pull()).resolves.toMatchObject({
+            status: "updated",
+        });
+        expect(readF(repo, "gone.md")).toBe("they edited\n");
+        await expectFsckClean(repo);
+    });
+
     it("pulls over HTTP end to end", async () => {
         const repo = withCleanup(await createRepoWithOrigin());
         const server = await startGitHttpServer(repo.dir);
@@ -453,6 +537,10 @@ describe("WasmGit phase 5 review regressions", { timeout: 300_000 }, () => {
     function puller(repo: TestRepo) {
         const ctx = createWasmGitManager(repo.repoPath);
         ctx.manager.fetch = () => Promise.resolve();
+        // pull fetches through this, with its own progress notice.
+        (
+            ctx.manager as unknown as { fetchWith: () => Promise<void> }
+        ).fetchWith = () => Promise.resolve();
         return ctx;
     }
     /** Diverge: run `ours` on main and `theirs` on a branch from the same base. */

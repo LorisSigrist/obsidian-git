@@ -4,6 +4,7 @@ import { SimpleGit } from "./gitManager/simpleGit";
 import ObsidianGit from "./main";
 import { openHistoryInGitHub, openLineInGitHub } from "./openInGitHub";
 import { IgnoreModal } from "./ui/modals/ignoreModal";
+import { GeneralModal } from "./ui/modals/generalModal";
 import { togglePreviewHunk } from "./editor/signs/tooltip";
 
 export function addCommmands(plugin: ObsidianGit) {
@@ -393,6 +394,29 @@ export function addCommmands(plugin: ObsidianGit) {
         name: "Delete branch",
         callback: () =>
             plugin.promiseQueue.addTask(() => plugin.gitActions.deleteBranch()),
+    });
+
+    plugin.addCommand({
+        id: "abort-merge",
+        name: "Abort merge",
+        callback: () =>
+            plugin.promiseQueue.addTask(async () => {
+                if (!(await plugin.gitManager.isMergeInProgress())) {
+                    new Notice("There is no merge to abort.");
+                    return;
+                }
+                const confirm = "Abort merge and discard the merge result";
+                const choice = await new GeneralModal(plugin, {
+                    options: ["Cancel", confirm],
+                    placeholder:
+                        "Put all files back to how they were before the pull? Edits made while resolving conflicts are lost.",
+                    onlySelection: true,
+                }).openAndGetResult();
+                if (choice !== confirm) return;
+                await plugin.gitManager.abortMerge();
+                new Notice("Merge aborted.");
+                plugin.app.workspace.trigger("obsidian-git:refresh");
+            }),
     });
 
     plugin.addCommand({

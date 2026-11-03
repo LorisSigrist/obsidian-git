@@ -499,6 +499,11 @@ export class SimpleGit extends GitManager {
         };
     }
 
+    async abortMerge(): Promise<void> {
+        await this.git.merge(["--abort"]);
+        this.plugin.setPluginState({ mergeInProgress: false });
+    }
+
     async isMergeInProgress(): Promise<boolean> {
         const mergeHead = await this.git.revparse(["--git-path", "MERGE_HEAD"]);
         const mergeHeadPath = path.resolve(

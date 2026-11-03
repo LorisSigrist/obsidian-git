@@ -3,6 +3,7 @@ import { execFileSync } from "child_process";
 import { randomBytes } from "crypto";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import type { HttpClient } from "../../src/gitManager/gitcore/transport";
+import type { GitProgress } from "../../src/types";
 import { withCleanup } from "../helpers/cleanup";
 import { nodeHttp, startGitHttpServer } from "../helpers/gitHttpServer";
 import { createRepoWithOrigin } from "../helpers/gitRepo";
@@ -143,7 +144,10 @@ describe("WasmGit partial clone", { timeout: 300_000 }, () => {
     it("pulls and pushes in a partial clone", async () => {
         const { repo, server } = await partialRemote();
         try {
-            const { manager, g, vault } = vaultManager(repo.dir, "vault");
+            const { manager, g, vault, plugin } = vaultManager(
+                repo.dir,
+                "vault"
+            );
             await manager.clone(server.url("remote.git"), ".");
             await manager.setConfig("user.name", "Phone");
             await manager.setConfig("user.email", "phone@example.com");
@@ -160,7 +164,24 @@ describe("WasmGit partial clone", { timeout: 300_000 }, () => {
 
             const { counter, http } = countingHttp();
             manager.http = http;
+            const stages: string[] = [];
+            (plugin as unknown as { statusBar: unknown }).statusBar = {
+                displayProgress: (p: GitProgress) => {
+                    const s =
+                        p.total !== undefined
+                            ? `${p.stage} ${p.processed}/${p.total}`
+                            : p.stage;
+                    if (stages[stages.length - 1] !== s) stages.push(s);
+                },
+                clearProgress: () => {},
+            };
             const pulled = await manager.pull();
+            expect(stages[0]).toBe("checking for changes");
+            expect(stages).toContain("downloading files 2/2");
+            expect(stages).toContain("writing files 1/2");
+            expect(stages.indexOf("downloading files 2/2")).toBeLessThan(
+                stages.indexOf("writing files 0/2")
+            );
             expect(pulled.status).toBe("updated");
             expect(readFileSync(path.join(vault, "note.md"), "utf8")).toBe(
                 "v3\n"

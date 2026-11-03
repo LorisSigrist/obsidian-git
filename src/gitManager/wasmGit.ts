@@ -263,10 +263,18 @@ export class WasmGit extends GitManager {
         await fetchObjects(repo, {
             ...(await this.remoteOptions(remote, undefined, action)),
             objects: await this.changedObjects(repo, from, to),
-            onBatch: ({ done, total, bytes }) =>
+            onBatch: ({ done, total, bytes }) => {
+                this.reportProgress(
+                    notice,
+                    action,
+                    "downloading files",
+                    done,
+                    total
+                );
                 notice?.setMessage(
                     `${action}: downloading files ${done.toLocaleString()} / ${total.toLocaleString()} (${formatBytes(bytes)})`
-                ),
+                );
+            },
         });
     }
 
@@ -929,6 +937,41 @@ export class WasmGit extends GitManager {
         }
     }
 
+    /**
+     * `git merge --abort`: put every file the merge touched back to HEAD's
+     * version (deleting files only the merge added) and end the merge.
+     * Edits made while resolving are lost.
+     */
+    async abortMerge(): Promise<void> {
+        return this.withGitOperation(GitOperation.checkout, async () => {
+            if (!(await this.isMergeInProgress())) {
+                throw new Error("There is no merge to abort.");
+            }
+            await this.withIndex(true, async (repo, index) => {
+                const head = await repo.flatten(await repo.commitTree("HEAD"));
+                const touched = new Set(index.conflicts.keys());
+                for (const [path, e] of index.entries) {
+                    const h = head.get(path);
+                    if (!h || h.oid !== e.oid || parseInt(h.mode, 8) !== e.mode)
+                        touched.add(path);
+                }
+                for (const path of head.keys()) {
+                    if (!index.entries.has(path)) touched.add(path);
+                }
+                const paths = [...touched];
+                await resetPaths(repo, index, paths);
+                await restoreFromIndex(repo, index, paths);
+                for (const path of paths) {
+                    if (!head.has(path)) {
+                        await repo.fs.remove(repo.vaultPath(path));
+                    }
+                }
+            });
+            await this.clearMergeState();
+            this.plugin.setPluginState({ mergeInProgress: false });
+        });
+    }
+
     // ---- Branches and remotes ----
 
     /** Move the working tree, index and HEAD to `ref` (a full ref name or oid). */
@@ -1214,27 +1257,62 @@ export class WasmGit extends GitManager {
     async fetch(remote?: string): Promise<void> {
         const progressNotice = this.showNotice("Initializing fetch");
         try {
-            const repo = await this.repo();
-            const name = remote ?? (await this.getCurrentRemote());
-            const config = await repo.readConfig();
-            const refspecs = config.getAll(`remote.${name}.fetch`);
-            await fetchRemote(repo, {
-                ...(await this.remoteOptions(name, progressNotice, "Fetching")),
-                remote: name,
-                refspecs:
-                    refspecs.length > 0
-                        ? refspecs
-                        : [`+refs/heads/*:refs/remotes/${name}/*`],
-                // A partial clone stays partial: contents come on demand.
-                filter:
-                    config.get(`remote.${name}.promisor`) === "true"
-                        ? (config.get(`remote.${name}.partialclonefilter`) ??
-                          "blob:none")
-                        : undefined,
-            });
+            await this.fetchWith(remote, progressNotice, "Fetching");
         } finally {
             progressNotice?.hide();
         }
+    }
+
+    private async fetchWith(
+        remote: string | undefined,
+        notice: Notice | undefined,
+        action: string
+    ): Promise<void> {
+        const repo = await this.repo();
+        const name = remote ?? (await this.getCurrentRemote());
+        const config = await repo.readConfig();
+        const refspecs = config.getAll(`remote.${name}.fetch`);
+        await fetchRemote(repo, {
+            ...(await this.remoteOptions(name, notice, action)),
+            remote: name,
+            refspecs:
+                refspecs.length > 0
+                    ? refspecs
+                    : [`+refs/heads/*:refs/remotes/${name}/*`],
+            // A partial clone stays partial: contents come on demand.
+            filter:
+                config.get(`remote.${name}.promisor`) === "true"
+                    ? (config.get(`remote.${name}.partialclonefilter`) ??
+                      "blob:none")
+                    : undefined,
+        });
+    }
+
+    /**
+     * Show where an operation is: in its notice (the only place on mobile)
+     * and in the desktop status bar.
+     */
+    private reportProgress(
+        notice: Notice | undefined,
+        action: string,
+        stage: string,
+        processed?: number,
+        total?: number
+    ): void {
+        const count =
+            total !== undefined
+                ? ` ${(processed ?? 0).toLocaleString()} / ${total.toLocaleString()}`
+                : "";
+        notice?.setMessage(`${action}: ${stage}${count}`);
+        this.plugin.statusBar?.displayProgress({
+            action,
+            stage,
+            processed,
+            total,
+            progress: total
+                ? Math.round((100 * (processed ?? 0)) / total)
+                : undefined,
+        });
     }
 
     async push(): Promise<PushResult> {
@@ -1322,153 +1400,163 @@ export class WasmGit extends GitManager {
 
     async pull(): Promise<PullResult> {
         return this.withGitOperation(GitOperation.pull, async () => {
-            await this.assertCloneFinished();
-            if (await this.isMergeInProgress()) {
-                throw new Error(
-                    "Cannot pull because a merge is still in progress. Commit or abort it first."
-                );
-            }
-            const branchInfo = await this.branchInfo();
-            if (!branchInfo.current) {
-                throw new Error("No current branch found. Cannot pull.");
-            }
-            const localCommit = await this.resolveRef(branchInfo.current);
-            if (!branchInfo.tracking) {
-                this.plugin.log("No tracking branch found. Ignoring pull.");
-                return { status: "skipped", reason: "no-upstream" };
-            }
-
-            await this.fetch();
-
-            const theirs = await this.resolveRef(branchInfo.tracking);
-            if (localCommit === theirs) return { status: "up-to-date" };
-            const { name, email } = await this.checkAuthorInfo();
-            const repo = await this.repo();
-            if (await isAncestor(repo, theirs, localCommit)) {
-                return { status: "up-to-date" };
-            }
-            const message = `Merge branch '${branchInfo.tracking}' into ${branchInfo.current}`;
-            const localTree = await repo.commitTree(localCommit);
-            const pullNotice = repo.objects.onMissing
-                ? this.showNotice("Pulling")
-                : undefined;
+            const notice = this.showNotice("Pulling: checking for changes");
             try {
-                await this.prefetchForCheckout(
-                    repo,
-                    localTree,
-                    await repo.commitTree(theirs),
-                    pullNotice,
-                    "Pulling"
-                );
+                return await this.pullWith(notice);
             } finally {
-                pullNotice?.hide();
+                notice?.hide();
             }
-
-            let result: string;
-            if (await isAncestor(repo, localCommit, theirs)) {
-                result = theirs;
-            } else {
-                const bases = await mergeBases(repo, localCommit, theirs);
-                if (bases.length === 0) {
-                    throw new Error(
-                        `Cannot pull: refusing to merge unrelated histories (${branchInfo.current} and ${branchInfo.tracking} share no commit).`
-                    );
-                }
-                if (bases.length > 1) {
-                    // Picking one base could silently undo a resolution made
-                    // on either side (criss-cross merges).
-                    throw new Error(
-                        `Cannot pull: ${branchInfo.current} and ${branchInfo.tracking} have ${bases.length} merge bases. Merge them on a device with Git.`
-                    );
-                }
-                const merge = await mergeTrees(
-                    repo,
-                    await repo.commitTree(bases[0]!),
-                    localTree,
-                    await repo.commitTree(theirs),
-                    {
-                        strategy: this.plugin.settings.mergeStrategy,
-                        labels: { ours: "HEAD", theirs: branchInfo.tracking },
-                    }
-                );
-                if (merge.conflicts.length > 0) {
-                    // Writing conflicts touches the whole tree, so only do it
-                    // when no local work could be lost.
-                    await this.ensureCleanPullWorktree(localCommit, true);
-                    await this.ensureNoIncomingFileCollisions(
-                        await this.getFileChangesCount(localCommit, theirs)
-                    );
-                    await this.materializeConflicts(
-                        localTree,
-                        merge.merged,
-                        merge.conflicts
-                    );
-                    await this.writeMergeState({
-                        ours: localCommit,
-                        theirs,
-                        message,
-                    });
-                    const files = merge.conflicts.map((c) => c.path);
-                    throw new GitConflictError(
-                        files,
-                        new MergeConflictError(files)
-                    );
-                }
-                const me = person(name, email);
-                result = await writeCommit(repo, {
-                    tree: await writeFlatTree(repo, merge.merged),
-                    parents: [localCommit, theirs],
-                    message: `${message}\n`,
-                    author: me,
-                    committer: me,
-                });
-            }
-
-            const resultTree = await repo.commitTree(result);
-            const changedFiles = await repo.diffTrees(localTree, resultTree);
-            if (changedFiles.length > 0) {
-                const filepaths = changedFiles.map((file) => file.path);
-                await this.ensureNoIncomingFileCollisions(changedFiles);
-                await this.ensureCleanPullWorktree(
-                    localCommit,
-                    true,
-                    filepaths
-                );
-                await this.withIndex(true, async (r, index, mtime) => {
-                    try {
-                        await checkoutTree(
-                            r,
-                            index,
-                            mtime,
-                            await r.ignoreRules(),
-                            localTree,
-                            resultTree,
-                            { filepaths }
-                        );
-                    } catch (e) {
-                        if (e instanceof CheckoutConflictError) {
-                            // eslint-disable-next-line preserve-caught-error -- Error.cause is unavailable with the project's ES2021 target.
-                            throw new Error(
-                                `Cannot pull with uncommitted working tree changes: ${e.filepaths.join(", ")}`
-                            );
-                        }
-                        throw e;
-                    }
-                });
-            }
-            // HEAD moves only once the working tree has the result.
-            await repo.refs.write(`refs/heads/${branchInfo.current}`, result);
-            return {
-                status: "updated",
-                outsideVault: 0,
-                files: changedFiles.map<FileStatusResult>((file) => ({
-                    path: file.path,
-                    workingDir: "P",
-                    index: "P",
-                    vaultPath: this.getRelativeVaultPath(file.path),
-                })),
-            };
         });
+    }
+
+    private async pullWith(notice: Notice | undefined): Promise<PullResult> {
+        await this.assertCloneFinished();
+        if (await this.isMergeInProgress()) {
+            throw new Error(
+                "Cannot pull because a merge is still in progress. Commit or abort it first."
+            );
+        }
+        const branchInfo = await this.branchInfo();
+        if (!branchInfo.current) {
+            throw new Error("No current branch found. Cannot pull.");
+        }
+        const localCommit = await this.resolveRef(branchInfo.current);
+        if (!branchInfo.tracking) {
+            this.plugin.log("No tracking branch found. Ignoring pull.");
+            return { status: "skipped", reason: "no-upstream" };
+        }
+
+        this.reportProgress(notice, "Pulling", "checking for changes");
+        await this.fetchWith(undefined, notice, "Pulling");
+
+        const theirs = await this.resolveRef(branchInfo.tracking);
+        if (localCommit === theirs) return { status: "up-to-date" };
+        const { name, email } = await this.checkAuthorInfo();
+        const repo = await this.repo();
+        if (await isAncestor(repo, theirs, localCommit)) {
+            return { status: "up-to-date" };
+        }
+        const message = `Merge branch '${branchInfo.tracking}' into ${branchInfo.current}`;
+        const localTree = await repo.commitTree(localCommit);
+        await this.prefetchForCheckout(
+            repo,
+            localTree,
+            await repo.commitTree(theirs),
+            notice,
+            "Pulling"
+        );
+
+        let result: string;
+        if (await isAncestor(repo, localCommit, theirs)) {
+            result = theirs;
+        } else {
+            const bases = await mergeBases(repo, localCommit, theirs);
+            if (bases.length === 0) {
+                throw new Error(
+                    `Cannot pull: refusing to merge unrelated histories (${branchInfo.current} and ${branchInfo.tracking} share no commit).`
+                );
+            }
+            if (bases.length > 1) {
+                // Picking one base could silently undo a resolution made
+                // on either side (criss-cross merges).
+                throw new Error(
+                    `Cannot pull: ${branchInfo.current} and ${branchInfo.tracking} have ${bases.length} merge bases. Merge them on a device with Git.`
+                );
+            }
+            this.reportProgress(notice, "Pulling", "merging");
+            const merge = await mergeTrees(
+                repo,
+                await repo.commitTree(bases[0]!),
+                localTree,
+                await repo.commitTree(theirs),
+                {
+                    strategy: this.plugin.settings.mergeStrategy,
+                    labels: { ours: "HEAD", theirs: branchInfo.tracking },
+                }
+            );
+            if (merge.conflicts.length > 0) {
+                // Writing conflicts touches the whole tree, so only do it
+                // when no local work could be lost.
+                await this.ensureCleanPullWorktree(localCommit, true);
+                await this.ensureNoIncomingFileCollisions(
+                    await this.getFileChangesCount(localCommit, theirs)
+                );
+                await this.materializeConflicts(
+                    localTree,
+                    merge.merged,
+                    merge.conflicts
+                );
+                await this.writeMergeState({
+                    ours: localCommit,
+                    theirs,
+                    message,
+                });
+                const files = merge.conflicts.map((c) => c.path);
+                throw new GitConflictError(
+                    files,
+                    new MergeConflictError(files)
+                );
+            }
+            const me = person(name, email);
+            result = await writeCommit(repo, {
+                tree: await writeFlatTree(repo, merge.merged),
+                parents: [localCommit, theirs],
+                message: `${message}\n`,
+                author: me,
+                committer: me,
+            });
+        }
+
+        const resultTree = await repo.commitTree(result);
+        const changedFiles = await repo.diffTrees(localTree, resultTree);
+        if (changedFiles.length > 0) {
+            const filepaths = changedFiles.map((file) => file.path);
+            await this.ensureNoIncomingFileCollisions(changedFiles);
+            await this.ensureCleanPullWorktree(localCommit, true, filepaths);
+            await this.withIndex(true, async (r, index, mtime) => {
+                try {
+                    await checkoutTree(
+                        r,
+                        index,
+                        mtime,
+                        await r.ignoreRules(),
+                        localTree,
+                        resultTree,
+                        {
+                            filepaths,
+                            onProgress: (done, total) =>
+                                this.reportProgress(
+                                    notice,
+                                    "Pulling",
+                                    "writing files",
+                                    done,
+                                    total
+                                ),
+                        }
+                    );
+                } catch (e) {
+                    if (e instanceof CheckoutConflictError) {
+                        // eslint-disable-next-line preserve-caught-error -- Error.cause is unavailable with the project's ES2021 target.
+                        throw new Error(
+                            `Cannot pull with uncommitted working tree changes: ${e.filepaths.join(", ")}`
+                        );
+                    }
+                    throw e;
+                }
+            });
+        }
+        // HEAD moves only once the working tree has the result.
+        await repo.refs.write(`refs/heads/${branchInfo.current}`, result);
+        return {
+            status: "updated",
+            outsideVault: 0,
+            files: changedFiles.map<FileStatusResult>((file) => ({
+                path: file.path,
+                workingDir: "P",
+                index: "P",
+                vaultPath: this.getRelativeVaultPath(file.path),
+            })),
+        };
     }
 
     private async ensureCleanPullWorktree(
