@@ -25,7 +25,7 @@ import {
     UnmergedPathsError,
 } from "./gitcore/errors";
 import { GitIndex, type IndexEntry } from "./gitcore/gitIndex";
-import type { Person } from "./gitcore/model";
+import { MODE_GITLINK, MODE_TREE, type Person } from "./gitcore/model";
 import type { RangeReader } from "./gitcore/repoFs";
 import {
     Repository,
@@ -34,7 +34,7 @@ import {
 } from "./gitcore/repository";
 import { CheckoutConflictError, checkoutTree } from "./gitcore/checkout";
 import { mergeTrees, writeFlatTree, type Conflict } from "./gitcore/merge";
-import { fetchRemote, pushRef } from "./gitcore/remote";
+import { fetchObjects, fetchRemote, pushRef } from "./gitcore/remote";
 import type { AuthCallbacks, HttpClient } from "./gitcore/transport";
 import { GeneralModal } from "../ui/modals/generalModal";
 import { splitRemoteBranch } from "../utils";
@@ -50,6 +50,18 @@ import {
     writeCommit,
     writeTree,
 } from "./gitcore/worktree";
+
+/**
+ * Present in the git directory while a clone is still downloading. It holds
+ * the remote URL, so running the clone again resumes instead of starting over.
+ */
+const CLONE_MARKER = "obsidian-git-clone";
+
+function formatBytes(n: number): string {
+    if (n < 1 << 20) return `${Math.round(n / 1024)} KB`;
+    if (n < 1 << 30) return `${Math.round(n / (1 << 20))} MB`;
+    return `${(n / (1 << 30)).toFixed(2)} GB`;
+}
 
 const decoder = new TextDecoder();
 
@@ -190,10 +202,82 @@ export class WasmGit extends GitManager {
                     root,
                     gitdir,
                     rangeReader: this.rangeReader,
-                }).ready(),
+                })
+                    .ready()
+                    .then(async (repo) => {
+                        await this.enableLazyFetch(repo);
+                        return repo;
+                    }),
             };
         }
         return this.cachedRepo.repo;
+    }
+
+    /**
+     * In a partial clone, download missing file contents on demand from the
+     * remote they were left on (`extensions.partialClone`).
+     */
+    private async enableLazyFetch(repo: Repository): Promise<void> {
+        if (!(await repo.exists())) return;
+        const remote = (await repo.readConfig()).get("extensions.partialclone");
+        repo.objects.onMissing = remote
+            ? async (oid) =>
+                  fetchObjects(repo, {
+                      ...(await this.remoteOptions(remote, undefined, "")),
+                      objects: [{ oid, path: oid }],
+                  })
+            : undefined;
+    }
+
+    /**
+     * The objects `to` has that `from` does not, for a download before a
+     * checkout from one to the other (only missing ones are fetched).
+     */
+    private async changedObjects(
+        repo: Repository,
+        from: string | undefined,
+        to: string
+    ): Promise<{ oid: string; path: string }[]> {
+        const flat =
+            from === undefined
+                ? await repo.flatten(to)
+                : await repo.flatten(
+                      to,
+                      (await repo.diffTrees(from, to)).map((c) => c.path)
+                  );
+        return [...flat]
+            .filter(([, e]) => e.mode !== MODE_GITLINK && e.mode !== MODE_TREE)
+            .map(([path, e]) => ({ oid: e.oid, path }));
+    }
+
+    /** Download what a checkout to `to` needs, with progress, in a partial clone. */
+    private async prefetchForCheckout(
+        repo: Repository,
+        from: string | undefined,
+        to: string,
+        notice: Notice | undefined,
+        action: string
+    ): Promise<void> {
+        const remote = (await repo.readConfig()).get("extensions.partialclone");
+        if (!remote || !repo.objects.onMissing) return;
+        await fetchObjects(repo, {
+            ...(await this.remoteOptions(remote, undefined, action)),
+            objects: await this.changedObjects(repo, from, to),
+            onBatch: ({ done, total, bytes }) =>
+                notice?.setMessage(
+                    `${action}: downloading files ${done.toLocaleString()} / ${total.toLocaleString()} (${formatBytes(bytes)})`
+                ),
+        });
+    }
+
+    /** Refuse what would build on a clone that has not finished. */
+    private async assertCloneFinished(): Promise<void> {
+        const repo = await this.repo();
+        if (await repo.fs.exists(`${repo.gitdir}/${CLONE_MARKER}`)) {
+            throw new Error(
+                "A clone into this vault has not finished. Run the clone command again to resume it."
+            );
+        }
     }
 
     private withSlowNotice<T>(fn: () => Promise<T>): Promise<T> {
@@ -321,7 +405,13 @@ export class WasmGit extends GitManager {
     }
 
     async checkRequirements(): Promise<"valid" | "missing-repo"> {
-        return (await (await this.repo()).exists()) ? "valid" : "missing-repo";
+        const repo = await this.repo();
+        // An unfinished clone is not a repository to work with yet; running
+        // the clone again resumes it.
+        return (await repo.exists()) &&
+            !(await repo.fs.exists(`${repo.gitdir}/${CLONE_MARKER}`))
+            ? "valid"
+            : "missing-repo";
     }
 
     async resolveRef(ref: string): Promise<string> {
@@ -738,6 +828,7 @@ export class WasmGit extends GitManager {
         selection?: AutoCommitGlobSelection;
         amend?: boolean;
     }): Promise<number> {
+        await this.assertCloneFinished();
         await this.checkAuthorInfo();
         await this.stageAll({ status, unstagedFiles, selection });
         return this.commit({ message, amend });
@@ -751,6 +842,7 @@ export class WasmGit extends GitManager {
         amend?: boolean;
     }): Promise<number> {
         return this.withGitOperation(GitOperation.commit, async () => {
+            await this.assertCloneFinished();
             try {
                 const { name, email } = await this.checkAuthorInfo();
                 const formatMessage = await this.formatCommitMessage(message);
@@ -846,13 +938,28 @@ export class WasmGit extends GitManager {
             const from = (await repo.headOid())
                 ? await repo.commitTree("HEAD")
                 : undefined;
+            const to = (await repo.objects.readCommit(oid)).tree;
+            const notice = repo.objects.onMissing
+                ? this.showNotice("Checking out")
+                : undefined;
+            try {
+                await this.prefetchForCheckout(
+                    repo,
+                    from,
+                    to,
+                    notice,
+                    "Checking out"
+                );
+            } finally {
+                notice?.hide();
+            }
             await checkoutTree(
                 repo,
                 index,
                 mtime,
                 await repo.ignoreRules(),
                 from,
-                (await repo.objects.readCommit(oid)).tree
+                to
             );
             if (headRef) await repo.refs.writeSymbolic("HEAD", headRef);
             else await repo.refs.write("HEAD", oid);
@@ -1118,6 +1225,12 @@ export class WasmGit extends GitManager {
                     refspecs.length > 0
                         ? refspecs
                         : [`+refs/heads/*:refs/remotes/${name}/*`],
+                // A partial clone stays partial: contents come on demand.
+                filter:
+                    config.get(`remote.${name}.promisor`) === "true"
+                        ? (config.get(`remote.${name}.partialclonefilter`) ??
+                          "blob:none")
+                        : undefined,
             });
         } finally {
             progressNotice?.hide();
@@ -1127,6 +1240,7 @@ export class WasmGit extends GitManager {
     async push(): Promise<PushResult> {
         const progressNotice = this.showNotice("Initializing push");
         return this.withGitOperation(GitOperation.push, async () => {
+            await this.assertCloneFinished();
             try {
                 const { tracking, current, remote } = await this.branchInfo();
                 if (!current) return { status: "blocked", reason: "no-branch" };
@@ -1208,6 +1322,7 @@ export class WasmGit extends GitManager {
 
     async pull(): Promise<PullResult> {
         return this.withGitOperation(GitOperation.pull, async () => {
+            await this.assertCloneFinished();
             if (await this.isMergeInProgress()) {
                 throw new Error(
                     "Cannot pull because a merge is still in progress. Commit or abort it first."
@@ -1234,6 +1349,20 @@ export class WasmGit extends GitManager {
             }
             const message = `Merge branch '${branchInfo.tracking}' into ${branchInfo.current}`;
             const localTree = await repo.commitTree(localCommit);
+            const pullNotice = repo.objects.onMissing
+                ? this.showNotice("Pulling")
+                : undefined;
+            try {
+                await this.prefetchForCheckout(
+                    repo,
+                    localTree,
+                    await repo.commitTree(theirs),
+                    pullNotice,
+                    "Pulling"
+                );
+            } finally {
+                pullNotice?.hide();
+            }
 
             let result: string;
             if (await isAncestor(repo, localCommit, theirs)) {
@@ -1493,8 +1622,18 @@ export class WasmGit extends GitManager {
      * fetch (shallow with `depth`), create the remote's default branch with
      * its upstream, and check it out. Untracked files in the way are not
      * overwritten; the clone stops before writing any file instead.
+     *
+     * Where the server supports it, the clone is partial: commits and folders
+     * first, then the current files' contents in batches small enough to hold
+     * in memory (older versions are downloaded when needed). If the download
+     * is interrupted, the next clone of the same URL resumes it.
      */
-    async clone(url: string, dir: string, depth?: number): Promise<void> {
+    async clone(
+        url: string,
+        dir: string,
+        depth?: number,
+        opts: { beforeCheckout?: () => Promise<void> } = {}
+    ): Promise<void> {
         const progressNotice = this.showNotice("Initializing clone");
         try {
             const root = dir === "." || dir === "" ? "" : normalizePath(dir);
@@ -1508,16 +1647,50 @@ export class WasmGit extends GitManager {
                 gitdir,
                 rangeReader: this.rangeReader,
             }).ready();
-            if (await repo.exists()) {
+            const marker = `${gitdir}/${CLONE_MARKER}`;
+            const unfinished = (await repo.fs.readText(marker))?.trim();
+            if (unfinished !== undefined && unfinished !== url) {
+                // An unfinished clone of another remote holds no work of the
+                // user's: start over instead of being stuck with it.
+                await repo.fs.rmdir(gitdir, true);
+            }
+            const resuming = unfinished === url;
+            if (resuming) {
+                // Packs being written when the app was closed.
+                const packDir = repo.objects.packDir;
+                for (const f of (await repo.fs.list(packDir)).files) {
+                    if (f.startsWith("tmp_pack_")) {
+                        await repo.fs.remove(`${packDir}/${f}`);
+                    }
+                }
+            }
+            if (!resuming && (await repo.exists())) {
                 throw new Error(`A repository already exists in ${dir}.`);
             }
+            let resumable = resuming;
             try {
-                await this.cloneInto(repo, url, depth, progressNotice);
+                await this.cloneInto(
+                    repo,
+                    url,
+                    depth,
+                    progressNotice,
+                    resuming,
+                    () => (resumable = true),
+                    opts.beforeCheckout
+                );
+                await repo.fs.remove(marker);
             } catch (e) {
                 // Leave nothing behind, so the clone can simply be retried
                 // and a half-made repository is never mistaken for a real one.
-                await repo.fs.rmdir(gitdir, true).catch(() => undefined);
-                throw e;
+                // Once contents are downloading, keep them for a resume.
+                if (!resumable) {
+                    await repo.fs.rmdir(gitdir, true).catch(() => undefined);
+                    throw e;
+                }
+                // eslint-disable-next-line preserve-caught-error -- Error.cause is unavailable with the project's ES2021 target.
+                throw new Error(
+                    `The clone did not finish: ${e instanceof Error ? e.message : String(e)} Run the clone again to resume it.`
+                );
             } finally {
                 this.cachedRepo = undefined;
             }
@@ -1530,18 +1703,36 @@ export class WasmGit extends GitManager {
         repo: Repository,
         url: string,
         depth: number | undefined,
-        progressNotice: Notice | undefined
+        progressNotice: Notice | undefined,
+        resuming: boolean,
+        markResumable: () => void,
+        beforeCheckout: (() => Promise<void>) | undefined
     ): Promise<void> {
-        await this.initAt(repo);
-        const config = await repo.readConfig();
-        config.set("remote.origin.url", url);
-        config.set(
-            "remote.origin.fetch",
-            "+refs/heads/*:refs/remotes/origin/*"
-        );
-        await repo.writeConfig(config);
+        const onProgress = progressNotice
+            ? (m: string) => {
+                  const last = m
+                      .split(/[\r\n]/)
+                      .filter(Boolean)
+                      .last();
+                  if (last) progressNotice.setMessage(`Cloning: ${last}`);
+              }
+            : undefined;
+        if (!resuming) {
+            await this.initAt(repo);
+            const config = await repo.readConfig();
+            config.set("remote.origin.url", url);
+            config.set(
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*"
+            );
+            await repo.writeConfig(config);
+            // Written first, so even a crash during the first download
+            // leaves a clone that the next attempt resumes.
+            await repo.fs.write(`${repo.gitdir}/${CLONE_MARKER}`, url);
+        }
 
-        const { remoteRefs } = await fetchRemote(repo, {
+        // On a resume, this only gets what the remote has added meanwhile.
+        const { remoteRefs, filtered } = await fetchRemote(repo, {
             url,
             http: this.http,
             auth: this.authCallbacks(),
@@ -1552,16 +1743,20 @@ export class WasmGit extends GitManager {
                 "+refs/tags/*:refs/tags/*",
             ],
             depth,
-            onProgress: progressNotice
-                ? (m) => {
-                      const last = m
-                          .split(/[\r\n]/)
-                          .filter(Boolean)
-                          .last();
-                      if (last) progressNotice.setMessage(`Cloning: ${last}`);
-                  }
-                : undefined,
+            filter: "blob:none",
+            onProgress,
         });
+        if (filtered) {
+            // As `git clone --filter` records it, so Git elsewhere agrees.
+            const config = await repo.readConfig();
+            config.set("core.repositoryformatversion", "1");
+            config.set("extensions.partialclone", "origin");
+            config.set("remote.origin.promisor", "true");
+            config.set("remote.origin.partialclonefilter", "blob:none");
+            await repo.writeConfig(config);
+            markResumable();
+        }
+        await this.enableLazyFetch(repo);
         // The remote's default branch: from the symref capability, else
         // the branch whose tip matches the remote's HEAD.
         const headOid = remoteRefs.refs.get("HEAD");
@@ -1586,7 +1781,40 @@ export class WasmGit extends GitManager {
         if (!branchRef) return; // empty remote: an empty repository
         const branch = branchRef.slice("refs/heads/".length);
         const tip = await repo.resolveCommit(`refs/remotes/origin/${branch}`);
+        const tree = (await repo.objects.readCommit(tip)).tree;
         await repo.refs.writeSymbolic("HEAD", branchRef);
+        await this.prefetchForCheckout(
+            repo,
+            undefined,
+            tree,
+            progressNotice,
+            "Cloning"
+        );
+        if (beforeCheckout) {
+            // Check for files in the way first: `beforeCheckout` may delete
+            // the config folder, and with it this plugin.
+            const configDir = this.app.vault.configDir;
+            try {
+                await checkoutTree(
+                    repo,
+                    new GitIndex(),
+                    0,
+                    await repo.ignoreRules(),
+                    undefined,
+                    tree,
+                    { checkOnly: true }
+                );
+            } catch (e) {
+                if (!(e instanceof CheckoutConflictError)) throw e;
+                const inTheWay = e.filepaths.filter(
+                    (f) => f !== configDir && !f.startsWith(`${configDir}/`)
+                );
+                if (inTheWay.length > 0) {
+                    throw new CheckoutConflictError(inTheWay);
+                }
+            }
+            await beforeCheckout();
+        }
         const index = new GitIndex();
         await checkoutTree(
             repo,
@@ -1594,7 +1822,13 @@ export class WasmGit extends GitManager {
             0,
             await repo.ignoreRules(),
             undefined,
-            (await repo.objects.readCommit(tip)).tree
+            tree,
+            {
+                onProgress: (done, total) =>
+                    progressNotice?.setMessage(
+                        `Cloning: writing files ${done.toLocaleString()} / ${total.toLocaleString()}`
+                    ),
+            }
         );
         await repo.writeIndex(index);
         await repo.refs.write(branchRef, tip);

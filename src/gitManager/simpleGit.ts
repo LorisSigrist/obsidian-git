@@ -1430,7 +1430,13 @@ export class SimpleGit extends GitManager {
         await this.git.init(false);
     }
 
-    async clone(url: string, dir: string, depth?: number): Promise<void> {
+    async clone(
+        url: string,
+        dir: string,
+        depth?: number,
+        opts: { beforeCheckout?: () => Promise<void> } = {}
+    ): Promise<void> {
+        await opts.beforeCheckout?.();
         await this.git.clone(
             url,
             path.join(

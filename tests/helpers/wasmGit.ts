@@ -99,6 +99,7 @@ export function createNodeVault(root: string) {
 
     return {
         adapter,
+        configDir: ".obsidian",
         create: adapter.write,
         createBinary: adapter.writeBinary,
         createFolder: adapter.mkdir,

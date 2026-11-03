@@ -43,6 +43,13 @@ export class ObjectDb {
     private stale = false;
     private readonly cache = new Map<string, GitObject>();
     private cacheBytes = 0;
+    private readonly fetching = new Map<string, Promise<void>>();
+
+    /**
+     * Fetches an object that is not here from the promisor remote, in a
+     * partial clone (file contents are downloaded on demand).
+     */
+    onMissing: ((oid: string) => Promise<void>) | undefined;
 
     constructor(
         private readonly fs: RepoFs,
@@ -73,6 +80,13 @@ export class ObjectDb {
         const previous = new Map((this.packs ?? []).map((p) => [p.name, p]));
         const { files } = await this.fs.list(this.packDir);
         const packs: Pack[] = [];
+        // WASM memory never shrinks, so the delta caches share a budget: a
+        // partial clone can have hundreds of packs.
+        const count = files.filter((f) => f.endsWith(".idx")).length;
+        const cacheLimit = Math.max(
+            1 << 20,
+            Math.min(8 << 20, Math.floor((64 << 20) / Math.max(1, count)))
+        );
         for (const f of files) {
             if (!f.endsWith(".idx")) continue;
             const name = f.slice(0, -4);
@@ -90,7 +104,7 @@ export class ObjectDb {
                 name,
                 path,
                 size: stat.size,
-                reader: new PackReader(idx, stat.size, 8 << 20),
+                reader: new PackReader(idx, stat.size, cacheLimit),
                 verified: false,
                 lock: Promise.resolve(),
             });
@@ -174,9 +188,16 @@ export class ObjectDb {
         if (cached) return cached;
         let obj = await this.readLoose(oid);
         if (!obj) {
-            const pack = await this.findPack(oid);
-            if (!pack) throw new NotFoundError(`object ${oid}`);
-            obj = await this.readPacked(pack, oid);
+            let pack = await this.findPack(oid);
+            if (!pack && this.onMissing) {
+                await this.fetchMissing(oid);
+                pack = await this.findPack(oid);
+                obj = pack ? null : await this.readLoose(oid);
+            }
+            if (!obj) {
+                if (!pack) throw new NotFoundError(`object ${oid}`);
+                obj = await this.readPacked(pack, oid);
+            }
         }
         if (
             obj.type !== "blob" &&
@@ -194,9 +215,26 @@ export class ObjectDb {
         return obj;
     }
 
-    async has(oid: string): Promise<boolean> {
+    /** One download per object, however many reads wait for it. */
+    private fetchMissing(oid: string): Promise<void> {
+        let p = this.fetching.get(oid);
+        if (!p) {
+            p = this.onMissing!(oid).finally(() => this.fetching.delete(oid));
+            this.fetching.set(oid, p);
+        }
+        return p;
+    }
+
+    /**
+     * Whether the object is stored here (never fetches). Without `rescan`, a
+     * miss does not look for packs added since the pack list was loaded.
+     */
+    async has(oid: string, rescan = true): Promise<boolean> {
         if (this.cache.has(oid)) return true;
         if (await this.fs.exists(this.loosePath(oid))) return true;
+        if (!rescan) {
+            return (await this.loadPacks()).some((p) => p.reader.has(oid));
+        }
         return (await this.findPack(oid)) !== undefined;
     }
 

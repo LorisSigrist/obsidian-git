@@ -66,7 +66,14 @@ export async function checkoutTree(
     ignore: IgnoreRules,
     from: string | undefined,
     to: string | undefined,
-    opts: { force?: boolean; filepaths?: string[] } = {}
+    opts: {
+        force?: boolean;
+        filepaths?: string[];
+        /** Only run the checks: throw if files are in the way, write nothing. */
+        checkOnly?: boolean;
+        /** Called before each file is written: (written so far, total). */
+        onProgress?: (done: number, total: number) => void;
+    } = {}
 ): Promise<Change[]> {
     const changes = await repo.diffTrees(from, to, opts.filepaths);
     if (changes.length === 0) return changes;
@@ -146,6 +153,7 @@ export async function checkoutTree(
         if (blocked.size > 0)
             throw new CheckoutConflictError([...blocked].sort());
     }
+    if (opts.checkOnly) return changes;
 
     // Deletions first: a folder being replaced by a file, or a case-only
     // rename, needs the old entries gone before the new ones are written.
@@ -160,9 +168,12 @@ export async function checkoutTree(
     }
     await pruneEmptyDirs(repo, emptied);
 
+    const toWrite = changes.filter((c) => toFlat.has(c.path)).length;
+    let written = 0;
     for (const { path } of changes) {
         const after = toFlat.get(path);
         if (!after) continue;
+        opts.onProgress?.(written++, toWrite);
         const vaultPath = repo.vaultPath(path);
         if (after.mode === MODE_GITLINK || after.mode === MODE_SYMLINK) {
             // Not representable in a vault; keep the index in step only.

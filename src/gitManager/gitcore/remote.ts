@@ -120,11 +120,13 @@ async function haves(repo: Repository, limit = 256): Promise<string[]> {
 /**
  * Store a pack: append it to a temporary file while indexing it in WASM,
  * resolve deltas by reading back ranges, then publish the pack and its index.
- * Returns the number of objects.
+ * Returns the number of objects. A `promisor` pack (from a partial fetch) is
+ * marked as such, so Git knows the objects it leaves out are on the remote.
  */
 export async function storePack(
     repo: Repository,
-    chunks: Uint8Array[]
+    chunks: Uint8Array[],
+    promisor = false
 ): Promise<number> {
     const dir = repo.objects.packDir;
     const tmp = `${dir}/tmp_pack_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -158,6 +160,7 @@ export async function storePack(
         }
         const name = `pack-${ix.checksum_hex()}`;
         const idx = ix.build_idx();
+        if (promisor) await repo.fs.write(`${dir}/${name}.promisor`, "");
         if (await repo.fs.exists(`${dir}/${name}.pack`)) {
             await repo.fs.remove(tmp);
         } else {
@@ -183,11 +186,41 @@ export interface FetchResult {
     remoteRefs: RemoteRefs;
     /** Local refs that changed: name → [old (or undefined), new]. */
     updated: Map<string, [string | undefined, string]>;
+    /** Whether the server applied `filter` (it may not support filters). */
+    filtered: boolean;
+}
+
+/**
+ * The ACK/NAK lines that end the negotiation. Without multi_ack there is a
+ * NAK or an ACK, but after "done" the server may also repeat ACKs for
+ * further common commits, so every ACK before the pack is consumed.
+ */
+function readAcks(reader: PktReader): void {
+    const first = reader.nextLine();
+    if (first === null || !(first === "NAK" || first.startsWith("ACK "))) {
+        throw new Error(`Unexpected negotiation response: ${first}`);
+    }
+    while (!reader.done && /^[0-9a-f]{4}(ACK |NAK)/.test(reader.peekText(8))) {
+        reader.next();
+    }
+}
+
+/** The pack in an upload-pack response, after the negotiation lines. */
+function packChunks(
+    reader: PktReader,
+    sideband: boolean,
+    onProgress?: (message: string) => void
+): Uint8Array[] {
+    const chunks: Uint8Array[] = [];
+    if (sideband) demuxSideband(reader, (c) => chunks.push(c), onProgress);
+    else chunks.push(reader.rest());
+    return chunks;
 }
 
 /**
  * `git fetch <remote>`: download what the refspecs need and update the
- * remote-tracking refs. With `depth`, fetch a shallow history.
+ * remote-tracking refs. With `depth`, fetch a shallow history; with
+ * `filter` (e.g. "blob:none"), a partial one, if the server supports it.
  */
 export async function fetchRemote(
     repo: Repository,
@@ -195,6 +228,7 @@ export async function fetchRemote(
         remote: string;
         refspecs: string[];
         depth?: number;
+        filter?: string;
     }
 ): Promise<FetchResult> {
     const session = new GitHttpSession(opts.http, opts.url, opts.auth);
@@ -215,6 +249,11 @@ export async function fetchRemote(
         if (!(await repo.objects.has(t.oid))) wants.add(t.oid);
     }
 
+    // Only partial when the missing contents can be fetched by id later.
+    const filtered =
+        opts.filter !== undefined &&
+        remoteRefs.capabilities.has("filter") &&
+        canFetchById(remoteRefs.capabilities);
     if (wants.size > 0) {
         const caps = remoteRefs.capabilities;
         const shallow = await readShallow(repo);
@@ -227,6 +266,7 @@ export async function fetchRemote(
         if (caps.has("no-progress") && !opts.onProgress)
             myCaps.push("no-progress");
         if (useShallow) myCaps.push("shallow");
+        if (filtered) myCaps.push("filter");
 
         const lines: Uint8Array[] = [];
         [...wants].forEach((oid, i) =>
@@ -238,6 +278,7 @@ export async function fetchRemote(
         if (opts.depth !== undefined) {
             lines.push(pktLine(`deepen ${opts.depth}\n`));
         }
+        if (filtered) lines.push(pktLine(`filter ${opts.filter}\n`));
         lines.push(FLUSH);
         for (const oid of await haves(repo))
             lines.push(pktLine(`have ${oid}\n`));
@@ -265,18 +306,16 @@ export async function fetchRemote(
                 else if (kind === "unshallow" && oid) shallow.delete(oid);
             }
         }
-        // One ACK or NAK closes the negotiation (no multi_ack requested).
-        const ack = reader.nextLine();
-        if (ack === null || !(ack === "NAK" || ack.startsWith("ACK "))) {
-            throw new Error(`Unexpected negotiation response: ${ack}`);
-        }
-        const chunks: Uint8Array[] = [];
-        if (myCaps.includes("side-band-64k")) {
-            demuxSideband(reader, (c) => chunks.push(c), opts.onProgress);
-        } else {
-            chunks.push(reader.rest());
-        }
-        await storePack(repo, chunks);
+        readAcks(reader);
+        await storePack(
+            repo,
+            packChunks(
+                reader,
+                myCaps.includes("side-band-64k"),
+                opts.onProgress
+            ),
+            filtered
+        );
         if (useShallow) await writeShallow(repo, shallow);
     }
 
@@ -314,7 +353,148 @@ export async function fetchRemote(
             await repo.refs.writeSymbolic(remoteHead, local);
         }
     }
-    return { remoteRefs, updated };
+    return { remoteRefs, updated, filtered };
+}
+
+export interface ObjectFetchProgress {
+    /** Objects downloaded so far, of `total`. */
+    done: number;
+    total: number;
+    /** Pack bytes downloaded so far. */
+    bytes: number;
+}
+
+function canFetchById(caps: Set<string>): boolean {
+    return (
+        caps.has("allow-reachable-sha1-in-want") ||
+        caps.has("allow-any-sha1-in-want")
+    );
+}
+
+/** Contents that are usually small; anything else may be large. */
+const SMALL_FILE =
+    /\.(md|txt|json|canvas|css|js|ts|csv|tsv|ya?ml|html?|xml|tex|bib|svg|ics|vcf|base|gitignore|gitattributes)$/i;
+
+/** Contents that are often huge: fetched one at a time. */
+const HUGE_FILE =
+    /\.(mp4|m4v|mov|avi|mkv|webm|wmv|zip|7z|rar|tar|tgz|gz|dmg|iso)$/i;
+
+/** Aimed-for size of one download, which is held in memory whole. */
+const BATCH_BYTES = 24 << 20;
+
+/**
+ * Download objects by id (in a partial clone: file contents), in batches
+ * small enough to hold in memory. Objects already here are skipped, so an
+ * interrupted download resumes where it stopped.
+ *
+ * The protocol cannot tell sizes in advance, so the batch size adapts to the
+ * sizes seen so far, separately for usually-small text files, possibly-large
+ * ones (PDFs, images, ...) and often-huge ones (videos, archives).
+ */
+export async function fetchObjects(
+    repo: Repository,
+    opts: RemoteOptions & {
+        objects: { oid: string; path: string }[];
+        onBatch?: (progress: ObjectFetchProgress) => void;
+    }
+): Promise<void> {
+    const missing: { oid: string; path: string }[] = [];
+    const seen = new Set<string>();
+    // One look at the pack directory, not one per missing object.
+    repo.objects.invalidatePacks();
+    for (const o of opts.objects) {
+        if (seen.has(o.oid)) continue;
+        seen.add(o.oid);
+        if (!(await repo.objects.has(o.oid, false))) missing.push(o);
+    }
+    if (missing.length === 0) return;
+    const session = new GitHttpSession(opts.http, opts.url, opts.auth);
+    const { capabilities: caps } = await discoverRefs(
+        session,
+        "git-upload-pack"
+    );
+    if (!canFetchById(caps)) {
+        throw new Error(
+            "The remote does not allow fetching file contents on demand, which this partial clone needs."
+        );
+    }
+    const myCaps = ["ofs-delta", AGENT];
+    if (caps.has("side-band-64k")) myCaps.push("side-band-64k");
+    if (caps.has("no-progress")) myCaps.push("no-progress");
+
+    const groups = [
+        {
+            items: missing.filter((o) => SMALL_FILE.test(o.path)),
+            avg: 16 << 10,
+            max: 1000,
+        },
+        {
+            items: missing.filter(
+                (o) => !SMALL_FILE.test(o.path) && !HUGE_FILE.test(o.path)
+            ),
+            avg: 4 << 20,
+            max: 8,
+        },
+        {
+            items: missing.filter((o) => HUGE_FILE.test(o.path)),
+            avg: BATCH_BYTES,
+            max: 1,
+        },
+    ];
+    const progress = { done: 0, total: missing.length, bytes: 0 };
+    opts.onBatch?.({ ...progress });
+    for (const group of groups) {
+        let fetched = 0;
+        let fetchedBytes = 0;
+        let lastAvg = 0;
+        for (let i = 0; i < group.items.length;) {
+            // The larger of the overall and the latest average, so a run of
+            // big files shrinks the next batch at once.
+            const avg = Math.max(
+                fetched > 0 ? fetchedBytes / fetched : group.avg,
+                lastAvg
+            );
+            const n = Math.max(
+                1,
+                Math.min(group.max, Math.floor(BATCH_BYTES / avg))
+            );
+            const batch = group.items.slice(i, i + n);
+            i += batch.length;
+            const lines = batch.map((o, j) =>
+                pktLine(
+                    `want ${o.oid}${j === 0 ? " " + myCaps.join(" ") : ""}\n`
+                )
+            );
+            lines.push(FLUSH, pktLine("done\n"));
+            const res = await session.request({
+                path: "/git-upload-pack",
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/x-git-upload-pack-request",
+                    Accept: "application/x-git-upload-pack-result",
+                },
+                body: concat(lines),
+            });
+            const reader = new PktReader(res.body);
+            readAcks(reader);
+            await storePack(
+                repo,
+                packChunks(reader, myCaps.includes("side-band-64k")),
+                true
+            );
+            fetched += batch.length;
+            fetchedBytes += res.body.length;
+            lastAvg = res.body.length / batch.length;
+            progress.done += batch.length;
+            progress.bytes += res.body.length;
+            opts.onBatch?.({ ...progress });
+        }
+    }
+    for (const o of missing) {
+        if (!(await repo.objects.has(o.oid))) {
+            throw new Error(`The remote did not send ${o.path} (${o.oid}).`);
+        }
+    }
 }
 
 /** Objects reachable from `oid`'s tree that are not in `have`, added to `out`. */
@@ -411,6 +591,13 @@ async function objectsToSend(
             have,
             out
         );
+    }
+    if (repo.objects.onMissing) {
+        // In a partial clone, contents never downloaded came from the
+        // remote, so it has them; new local content is always stored here.
+        for (const oid of out) {
+            if (!(await repo.objects.has(oid))) out.delete(oid);
+        }
     }
     return [...out];
 }

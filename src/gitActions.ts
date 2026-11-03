@@ -204,6 +204,7 @@ export class GitActions {
             dir = ".";
         }
 
+        let beforeCheckout: (() => Promise<void>) | undefined;
         if (dir === ".") {
             const containsConflictDir = await new GeneralModal(this.plugin, {
                 options: ["NO", "YES"],
@@ -224,10 +225,14 @@ export class GitActions {
                 if (!shouldDelete) {
                     return { status: "cancelled", reason: "safety-declined" };
                 }
-                await this.plugin.app.vault.adapter.rmdir(
-                    this.plugin.app.vault.configDir,
-                    true
-                );
+                // Only once everything is downloaded: if the download fails
+                // or the app is closed, this plugin is still installed.
+                beforeCheckout = async () => {
+                    const { adapter, configDir } = this.plugin.app.vault;
+                    if (await adapter.exists(configDir)) {
+                        await adapter.rmdir(configDir, true);
+                    }
+                };
             }
         }
 
@@ -257,7 +262,8 @@ export class GitActions {
             await this.plugin.gitManager.clone(
                 formatRemoteUrl(url),
                 dir,
-                depthInt
+                depthInt,
+                { beforeCheckout }
             );
             if (customDir) {
                 await this.plugin.saveSettings();

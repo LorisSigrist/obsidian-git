@@ -106,7 +106,13 @@ export abstract class GitManager {
 
     abstract init(): Promise<void>;
 
-    abstract clone(url: string, dir: string, depth?: number): Promise<void>;
+    /** `beforeCheckout` runs once the download is done, right before files are written. */
+    abstract clone(
+        url: string,
+        dir: string,
+        depth?: number,
+        opts?: { beforeCheckout?: () => Promise<void> }
+    ): Promise<void>;
 
     /** Sets a repository-local value, or removes it when value is undefined. */
     abstract setConfig(
