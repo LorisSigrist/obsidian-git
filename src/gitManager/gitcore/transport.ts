@@ -216,7 +216,7 @@ export class GitHttpSession {
         if (res.status < 200 || res.status >= 300) {
             throw new HttpError(
                 res.status,
-                String(res.status),
+                `(${req.method} ${req.path.split("?")[0]})`,
                 decoder.decode(res.body.subarray(0, 512))
             );
         }

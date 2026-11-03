@@ -60,7 +60,13 @@ export class HttpError extends GitError {
         readonly statusMessage: string,
         readonly response?: string
     ) {
-        super(`HTTP Error: ${statusCode} ${statusMessage}`);
+        // The server's own explanation (e.g. GitHub's "Permission denied")
+        // is what makes a 403 debuggable.
+        const detail = response?.trim().split("\n")[0]?.slice(0, 200);
+        super(
+            `HTTP Error: ${statusCode} ${statusMessage}` +
+                (detail ? ` - ${detail}` : "")
+        );
     }
 }
 
